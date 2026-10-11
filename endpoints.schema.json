@@ -22,7 +22,11 @@
           "timeout_ms":        { "type": "integer", "minimum": 250, "maximum": 30000, "default": 3000 },
           "expected_status":   { "type": "array", "items": { "type": "integer" }, "description": "If set, only these codes count as healthy" },
           "slack_webhook_url": { "type": "string", "description": "Optional Slack incoming-webhook URL" },
-          "enabled":           { "type": "boolean", "default": true }
+          "enabled":           { "type": "boolean", "default": true },
+          "severity":          { "type": "string", "maxLength": 20, "description": "Optional label shown in the alert header, e.g. critical" },
+          "timezone":          { "type": "string", "description": "Optional IANA time zone; alerts show the client's local time next to UTC, e.g. America/Chicago" },
+          "runbook_url":       { "type": "string", "pattern": "^https://", "description": "Optional; shown as a Runbook button on alerts" },
+          "dashboard_url":     { "type": "string", "pattern": "^https://", "description": "Optional; shown as a Dashboard button on alerts" }
         }
       }
     }

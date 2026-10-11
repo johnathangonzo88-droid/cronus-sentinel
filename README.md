@@ -46,10 +46,24 @@ file with `ops_export_endpoints`. Paste the whole file into the
 | 1st failed probe | counter = 1, no alert |
 | Re-probe 20 s later also fails (or next run fails) | counter = 2 → 🔴 INCIDENT |
 | Still down | silent; reminder every 6 failed checks |
-| First healthy probe | 🟢 RESOLVED, counter reset |
+| First healthy probe | 🟢 RECOVERED with total downtime and cause, counter reset |
 
 A probe fails on HTTP 5xx, HTTP 404, connection errors, or latency over
 `timeout_ms` (default 3000). Counters persist between runs in the Actions cache.
+
+### What an incident card tells the client
+
+Every field appears only when the check actually saw it, so nothing is guessed:
+
+- **Header**: DOWN, SLOW or DEGRADED, the endpoint name, optional severity, then the exact method and URL.
+- **When**: when it started and how long ago, plus the last healthy check, in UTC and the client's local time.
+- **Evidence**: status with its name, latency vs. budget, the hosting/CDN seen in the headers
+  (Cloudflare, Vercel, Netlify, Render, Fly.io, Heroku, Shopify), a request ID to search their logs for,
+  and a short excerpt of the error body with keys, tokens and passwords redacted.
+- **Where**: for Cloudflare 52x and Vercel platform errors, which side failed.
+- **Next step**: advice specific to the failure (DNS, expired certificate, refused connection, each
+  Cloudflare 52x code, 401/403, 405, 429, 502–504…).
+- **Buttons**: Runbook and Dashboard, when those links are set.
 
 ## Public logs, private clients
 

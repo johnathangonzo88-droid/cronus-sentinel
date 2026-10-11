@@ -26,6 +26,13 @@ async def missing(_):   return web.Response(status=404)
 async def slow(_):
     await asyncio.sleep(1.5)
     return web.Response(text="late")
+async def edge(_):      # looks like Cloudflare failing to reach the origin
+    return web.Response(status=200 if flip["recovered"] else 522,
+                        headers={"cf-ray": "8c1f2a9b3d4e5f60-ORD", "server": "cloudflare"},
+                        text="<html><title>Connection timed out</title></html>", content_type="text/html")
+async def leaky(_):     # an error body that contains a secret, which must be redacted
+    return web.json_response({"error": "db down", "api_key": "sk_live_SHOULDNOTSHOW"}, status=500,
+                             headers={"x-request-id": "req-abc123"})
 
 
 def run_sentinel(tmp: Path, cfg: dict) -> str:
@@ -40,7 +47,8 @@ def run_sentinel(tmp: Path, cfg: dict) -> str:
 async def main():
     app = web.Application()
     app.add_routes([web.get("/ok", ok), web.get("/err", err),
-                    web.get("/missing", missing), web.get("/slow", slow)])
+                    web.get("/missing", missing), web.get("/slow", slow),
+                    web.get("/edge", edge), web.get("/leaky", leaky)])
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", PORT).start()
@@ -52,6 +60,13 @@ async def main():
         {"client_id": "t", "endpoint_name": "not-found", "target_url": f"{base}/missing", "telegram_chat_id": "1"},
         {"client_id": "t", "endpoint_name": "too-slow", "target_url": f"{base}/slow", "telegram_chat_id": "1", "timeout_ms": 1000},
         {"client_id": "t", "endpoint_name": "dead-port", "target_url": "http://127.0.0.1:9", "telegram_chat_id": "1"},
+    ]}
+    rich = {"endpoints": [
+        {"client_id": "acme", "endpoint_name": "Checkout API", "target_url": f"{base}/edge",
+         "telegram_chat_id": "1", "severity": "critical", "timezone": "America/Chicago",
+         "runbook_url": "https://example.com/runbook", "slack_webhook_url": "https://hooks.example/x"},
+        {"client_id": "acme", "endpoint_name": "Orders API", "target_url": f"{base}/leaky",
+         "telegram_chat_id": "1"},
     ]}
 
     with tempfile.TemporaryDirectory() as d:
@@ -99,6 +114,47 @@ async def main():
         assert sorted(summary["opened"]) == [1, 2, 3, 4], summary
         assert summary["alerts_sent"] == 4 and summary["alerts_failed"] == 0
         print("run 5: public log masked; cronus-summary annotation correct ✓")
+
+        # Rich incident cards: evidence, diagnosis, local time, buttons, redaction.
+        flip["recovered"] = False
+        rich_tmp = Path(tempfile.mkdtemp())
+        healthy_first = {"endpoints": [dict(rich["endpoints"][0], target_url=f"{base}/ok")]}
+        await loop.run_in_executor(None, run_sentinel, rich_tmp, healthy_first)  # records LAST OK
+        await loop.run_in_executor(None, run_sentinel, rich_tmp, rich)
+        c = await loop.run_in_executor(None, run_sentinel, rich_tmp, rich)
+        edge_card = c.split("[INCIDENT]")[1]
+        for want in ("🔴 <b>DOWN</b> · <b>Checkout API</b> · CRITICAL", "GET http://127.0.0.1",
+                     "522 ", "SINCE", "LAST OK", "UTC · ", "SERVED BY Cloudflare",
+                     "REQ ID    cf-ray 8c1f2a9b3d4e5f60-ORD", "page title: Connection timed out",
+                     "Between Cloudflare and your server", "[button] Runbook → https://example.com/runbook",
+                     "<i>Cronus Sentinel · acme</i>"):
+            assert want in edge_card, f"missing {want!r} in:\n{edge_card}"
+        assert "none since monitoring began" not in edge_card
+        slack = c.split("DRY RUN → Slack [INCIDENT]")[1].split("--- DRY RUN")[0]
+        assert "*DOWN*" in slack and "<https://example.com/runbook|Runbook>" in slack, slack
+        assert "<title>" not in slack and "<b>" not in slack
+        leaky_card = c.split("<b>Orders API</b>")[1].split("--- DRY RUN")[0]
+        assert "x-request-id req-abc123" in leaky_card and "500 Internal Server Error" in leaky_card
+        assert "SHOULDNOTSHOW" not in c and "[redacted]" in leaky_card, leaky_card
+        print("run 6: incident card carries evidence, diagnosis, local time, buttons; secrets redacted ✓")
+
+        flip["recovered"] = True
+        rcv = await loop.run_in_executor(None, run_sentinel, rich_tmp, rich)
+        card = rcv.split("[RESOLVED]")[1]
+        for want in ("🟢 <b>RECOVERED</b> · <b>Checkout API</b>", "DOWNTIME  ~", "FAILED    2 checks",
+                     "CAUSE     522"):
+            assert want in card, f"missing {want!r} in:\n{card}"
+        print("run 7: recovery card shows downtime, failed checks and cause ✓")
+
+        env = {**os.environ, "DRY_RUN": "1", "TEST_ALERT": "1", "SENTINEL_VERBOSE_LOGS": "1",
+               "ENDPOINTS_JSON": json.dumps(rich), "STATE_FILE": str(rich_tmp / "t.json")}
+        t = subprocess.run([sys.executable, str(ROOT / "sentinel.py")], env=env,
+                           capture_output=True, text=True, timeout=60)
+        assert t.returncode == 0 and "TEST ALERT" in t.stdout and "sample" in t.stdout, t.stdout + t.stderr
+        assert "[test] 2/2 test alert(s) delivered" in t.stdout
+        print("run 8: test alert shows a fully filled sample card ✓")
+        print("\n--- sample rich incident card ---")
+        print(edge_card.split("--- DRY RUN")[0])
         print("\n--- sample incident payload ---")
         print(r2.split("--- DRY RUN", 2)[1][:900])
 

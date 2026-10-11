@@ -36,6 +36,12 @@ Secrets and variables → Actions). Updating it **replaces the whole list**, so:
 
    Optional fields: `method`, `timeout_ms` (default 3000), `failure_threshold`
    (default 2), `slack_webhook_url`, `enabled`. See `endpoints.schema.json`.
+
+   Worth asking every client for (they make alerts far more useful):
+   - `timezone` — e.g. `"America/Chicago"`; alerts show their local time next to UTC.
+   - `severity` — e.g. `"critical"` for checkout or payment paths; shown in the alert header.
+   - `runbook_url` / `dashboard_url` — https links that become buttons on every alert
+     (their runbook doc, hosting dashboard, or log search).
 3. Check it's valid JSON (any JSON validator), then paste the full list into the secret.
 
 ## 4. Confirm the URLs are healthy now

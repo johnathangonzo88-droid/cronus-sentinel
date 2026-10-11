@@ -49,12 +49,15 @@ import hashlib
 import html
 import json
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
@@ -94,6 +97,10 @@ class Endpoint:
     expected_status: list[int] = field(default_factory=list)  # empty = "not 404, not 5xx"
     slack_webhook_url: str = ""
     enabled: bool = True
+    severity: str = ""                        # optional label shown in the header, e.g. "critical"
+    timezone: str = ""                        # optional IANA zone for local times, e.g. "America/Chicago"
+    runbook_url: str = ""                     # optional; becomes a button on the alert
+    dashboard_url: str = ""                   # optional; becomes a button on the alert
 
     @property
     def key(self) -> str:
@@ -106,9 +113,17 @@ class ProbeResult:
     ok: bool
     status: int | None          # None = no HTTP response at all
     latency_ms: int
-    error: str = ""             # "timeout", "connection: ...", or ""
+    error: str = ""             # "", "timeout", "dns", "tls", "refused", "disconnected", "connection"
     checked_at: str = ""
     blocked: bool = False       # a bot-protection challenge answered instead of the app
+    # Evidence for the alert card (filled on failures only; never written to the public log)
+    reason: str = ""            # HTTP reason phrase, e.g. "Internal Server Error"
+    error_detail: str = ""      # low-level connection error text
+    served_by: str = ""         # hosting/CDN detected from response headers
+    request_id: str = ""        # "<header> <value>" the client can search their logs for
+    platform_error: str = ""    # e.g. Vercel's x-vercel-error code
+    body_excerpt: str = ""      # first line of the response body, redacted and trimmed
+    final_url: str = ""         # set when redirects led somewhere other than target_url
 
 
 REQUIRED = ("client_id", "endpoint_name", "target_url", "telegram_chat_id")
@@ -145,6 +160,18 @@ def load_endpoints() -> list[Endpoint]:
         clean = {k: v for k, v in item.items() if k in allowed}
         clean["telegram_chat_id"] = str(clean["telegram_chat_id"])
         clean["method"] = str(clean.get("method", "GET")).upper()
+        tz = str(clean.get("timezone") or "")
+        if tz:
+            try:
+                ZoneInfo(tz)
+            except (ZoneInfoNotFoundError, ValueError):
+                problems.append(f"endpoint #{i}: unknown timezone (use an IANA name like America/Chicago)")
+                continue
+        bad_link = [k for k in ("runbook_url", "dashboard_url")
+                    if clean.get(k) and not str(clean[k]).startswith("https://")]
+        if bad_link:
+            problems.append(f"endpoint #{i}: {', '.join(bad_link)} must start with https://")
+            continue
         endpoints.append(Endpoint(**clean))
 
     if problems:
@@ -177,8 +204,131 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_FILE)  # atomic swap so a crash never leaves half a file
 
 
+TS_FORMAT = "%Y-%m-%d %H:%M:%S UTC"
+
+
 def utc_now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime(TS_FORMAT)
+
+
+def parse_ts(ts: str | None) -> datetime | None:
+    """Inverse of utc_now(); None for missing or unreadable values."""
+    if not ts:
+        return None
+    try:
+        return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def fmt_duration(delta: timedelta) -> str:
+    """'45 s', '7 min', '2 h 05 min', '1 d 3 h'."""
+    s = max(0, int(delta.total_seconds()))
+    if s < 60:
+        return f"{s} s"
+    m = s // 60
+    if m < 60:
+        return f"{m} min"
+    h, m = divmod(m, 60)
+    if h < 24:
+        return f"{h} h {m:02d} min"
+    d, h = divmod(h, 24)
+    return f"{d} d {h} h"
+
+
+def fmt_when(dt: datetime | None, tz_name: str = "", ref: datetime | None = None) -> str:
+    """'12:52 UTC' (+ 'Oct 11' when not today) and the client's local time if configured."""
+    if dt is None:
+        return "—"
+    ref = ref or datetime.now(timezone.utc)
+    day = "" if dt.date() == ref.date() else dt.strftime("%b %d ").replace(" 0", " ")
+    out = f"{day}{dt:%H:%M} UTC"
+    if tz_name:
+        local = dt.astimezone(ZoneInfo(tz_name))
+        out += f" · {local:%I:%M %p}".replace(" 0", " ") + f" {local:%Z}"
+    return out
+
+
+CLOUDFLARE_NAMES = {520: "Web Server Returned an Unknown Error", 521: "Web Server Is Down",
+                    522: "Connection Timed Out", 523: "Origin Is Unreachable",
+                    524: "A Timeout Occurred", 525: "SSL Handshake Failed",
+                    526: "Invalid SSL Certificate", 530: "Origin DNS Error"}
+
+
+def status_text(r: "ProbeResult") -> str:
+    """'500 Internal Server Error', 'NO RESPONSE (dns)', '200 OK, but too slow'."""
+    if r.status is None:
+        return f"NO RESPONSE ({r.error})" if r.error else "NO RESPONSE"
+    reason = r.reason if r.reason and r.reason.lower() != "unknown" else ""
+    if not reason:
+        try:
+            reason = HTTPStatus(r.status).phrase
+        except ValueError:
+            reason = CLOUDFLARE_NAMES.get(r.status, "")
+    text = f"{r.status} {reason}".strip()
+    if r.error == "timeout":
+        text += ", over budget"
+    return text
+
+
+# --------------------------------------------------------------------------- #
+# Evidence from a failed response
+# --------------------------------------------------------------------------- #
+# Headers that carry an ID the client can paste into their own log search, most specific first.
+REQUEST_ID_HEADERS = ("x-request-id", "x-correlation-id", "x-vercel-id", "fly-request-id",
+                      "x-nf-request-id", "rndr-id", "x-amzn-requestid", "x-amz-cf-id", "cf-ray")
+
+SECRET_RE = re.compile(
+    r"""(?ix)
+    ( ["']?(?:token|secret|password|passwd|api[_-]?key|access[_-]?key|authorization|session)["']?
+      \s*[:=]\s*["']? )
+    [^"',\s}&]+""")
+BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+
+
+def detect_platform(h: Any) -> str:
+    """Name the hosting/CDN layers visible in the response headers, outermost first."""
+    found = []
+    server = h.get("server", "").strip()
+    if "cf-ray" in h or server.lower() == "cloudflare":
+        found.append("Cloudflare")
+    if "x-amz-cf-id" in h:
+        found.append("CloudFront")
+    if "x-vercel-id" in h or server.lower() == "vercel":
+        found.append("Vercel")
+    if "x-nf-request-id" in h or server.lower() == "netlify":
+        found.append("Netlify")
+    if "fly-request-id" in h:
+        found.append("Fly.io")
+    if "rndr-id" in h:
+        found.append("Render")
+    if "vegur" in h.get("via", "").lower():
+        found.append("Heroku")
+    if "x-shopid" in h or "x-shopify-stage" in h:
+        found.append("Shopify")
+    if not found and server:
+        found.append(server[:40])
+    return " → ".join(found)
+
+
+def find_request_id(h: Any) -> str:
+    for name in REQUEST_ID_HEADERS:
+        if h.get(name):
+            return f"{name} {h[name][:64]}"
+    return ""
+
+
+def body_excerpt(body: bytes, content_type: str, limit: int = 160) -> str:
+    """A short, single-line, secret-redacted look at what the server said."""
+    if not body:
+        return ""
+    text = body[:8192].decode("utf-8", "replace")
+    if "html" in content_type.lower() or text.lstrip()[:15].lower().startswith(("<!doctype", "<html")):
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.I | re.S)
+        text = f"page title: {html.unescape(m.group(1))}" if m else re.sub(r"<[^>]+>", " ", text)
+    text = " ".join(text.split())
+    text = BEARER_RE.sub(r"\1 [redacted]", SECRET_RE.sub(r"\1[redacted]", text))
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def keys_hash(keys: list[str]) -> str:
@@ -202,7 +352,7 @@ async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semap
         try:
             async with session.request(ep.method, ep.target_url, timeout=timeout,
                                        allow_redirects=True) as resp:
-                await resp.read()  # full body counts toward latency
+                body = await resp.read()  # full body counts toward latency
                 latency = int((time.perf_counter() - start) * 1000)
                 status = resp.status
                 # Cloudflare bot protection answers with a challenge page instead of
@@ -216,26 +366,123 @@ async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semap
                 else:
                     ok = status != 404 and status < 500
                 # Slow-but-successful still counts as a failure past the budget.
+                error = ""
                 if latency > ep.timeout_ms:
-                    return ProbeResult(False, status, latency, "timeout", utc_now())
-                return ProbeResult(ok, status, latency, "", utc_now())
+                    ok, error = False, "timeout"
+                result = ProbeResult(ok, status, latency, error, utc_now(), reason=resp.reason or "")
+                if not ok:
+                    h = resp.headers
+                    result.served_by = detect_platform(h)
+                    result.request_id = find_request_id(h)
+                    result.platform_error = h.get("x-vercel-error", "")[:60]
+                    result.body_excerpt = body_excerpt(body, h.get("content-type", ""))
+                    final = str(resp.url)
+                    if final.rstrip("/") != ep.target_url.rstrip("/"):
+                        result.final_url = final
+                return result
         except asyncio.TimeoutError:
             latency = int((time.perf_counter() - start) * 1000)
             return ProbeResult(False, None, latency, "timeout", utc_now())
         except aiohttp.ClientError as exc:
             latency = int((time.perf_counter() - start) * 1000)
-            return ProbeResult(False, None, latency, f"connection: {type(exc).__name__}", utc_now())
+            return ProbeResult(False, None, latency, classify_error(exc), utc_now(),
+                               error_detail=error_text(exc))
+
+
+def classify_error(exc: BaseException) -> str:
+    """Turn an aiohttp exception into a kind the alert can give specific advice for."""
+    dns_error = getattr(aiohttp, "ClientConnectorDNSError", ())  # aiohttp >= 3.10
+    if isinstance(exc, (aiohttp.ClientConnectorCertificateError, aiohttp.ClientSSLError)):
+        return "tls"
+    if dns_error and isinstance(exc, dns_error):
+        return "dns"
+    if isinstance(exc, aiohttp.ClientConnectorError):
+        os_err = getattr(exc, "os_error", None)
+        if isinstance(os_err, OSError) and "name" in str(os_err).lower() and "resol" in str(os_err).lower():
+            return "dns"
+        return "refused"
+    if isinstance(exc, (aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError)):
+        return "disconnected"
+    return "connection"
+
+
+def error_text(exc: BaseException) -> str:
+    """The most useful line of a connection error, e.g. 'certificate has expired'."""
+    inner = getattr(exc, "os_error", None) or getattr(exc, "certificate_error", None) or exc
+    text = getattr(inner, "reason", None) or getattr(inner, "strerror", None) or str(inner)
+    text = " ".join(str(text).split()) or type(exc).__name__
+    return text[:120]
+
+
+CLOUDFLARE_5XX = {
+    520: "Your server sent Cloudflare an empty or malformed response. Check that the app process "
+         "isn't crashing mid-request, and look for oversized response headers.",
+    521: "Your server refused Cloudflare's connection. The web server is down or a firewall is "
+         "blocking Cloudflare's IP ranges.",
+    522: "Cloudflare timed out connecting to your server. The host is overloaded, offline, or "
+         "dropping Cloudflare's IPs at the firewall.",
+    523: "Cloudflare can't reach your server's address. Check the origin's DNS record and routing.",
+    524: "Your server accepted the connection but took over 100 s to answer. Look for a stuck "
+         "query or long-running job in this request path.",
+    525: "TLS handshake between Cloudflare and your server failed. Check the origin certificate "
+         "and the SSL mode in Cloudflare.",
+    526: "Your server's certificate is invalid for Cloudflare's Full (strict) mode. Renew or "
+         "replace the origin certificate.",
+    530: "Cloudflare can't route to your origin (often a stopped Tunnel or a DNS error). "
+         "Check the tunnel and the origin DNS record.",
+}
+
+
+def diagnose(r: ProbeResult) -> tuple[str, str]:
+    """(where it broke, next step). 'where' is empty when the evidence doesn't say."""
+    s = r.status or 0
+    if "Cloudflare" in r.served_by and s in CLOUDFLARE_5XX:
+        return "Between Cloudflare and your server (Cloudflare itself is up)", CLOUDFLARE_5XX[s]
+    if r.platform_error:
+        where = f"Vercel platform: {r.platform_error}"
+        if "FUNCTION" in r.platform_error:
+            return where, ("The serverless function failed or timed out. Open Vercel → Logs for "
+                           "this request ID; check the latest deploy and function timeouts.")
+        if "DEPLOYMENT" in r.platform_error:
+            return where, "The deployment is missing or paused. Check the project's production deployment."
+        return where, "Look up this error code in Vercel's docs and the request ID in Vercel → Logs."
+    action = recommend_action(r)
+    if r.request_id and (r.status or 0) >= 500:
+        name, _, value = r.request_id.partition(" ")
+        action += f" Search your logs for {name} {value} to find this exact request."
+    return "", action
 
 
 def recommend_action(r: ProbeResult) -> str:
     """Plain-language next step for the developer on call."""
     if r.error == "timeout":
-        return ("Response exceeded the latency budget. Check upstream dependencies "
-                "(DB, third-party APIs), cold starts, and recent traffic spikes.")
-    if r.error.startswith("connection"):
+        if r.status is not None:
+            return (f"The endpoint answered but took {r.latency_ms} ms. Check slow queries, "
+                    "third-party API calls in this path, and recent traffic spikes.")
+        return ("No response within the budget. Check whether the host is overloaded or hung, "
+                "and upstream dependencies (DB, third-party APIs).")
+    if r.error == "dns":
+        return ("The domain didn't resolve. Check the DNS records and that the domain "
+                "registration hasn't lapsed.")
+    if r.error == "tls":
+        return ("The TLS certificate failed verification (often expired or wrong hostname). "
+                "Renew it or check the auto-renewal job.")
+    if r.error == "refused":
+        return ("The connection was refused or couldn't be made. Check that the host process is "
+                "running and listening, and firewall/WAF rules.")
+    if r.error == "disconnected":
+        return ("The server closed the connection before finishing its answer. Look for crashes "
+                "or restarts in the app logs at this time.")
+    if r.error:
         return ("No HTTP response. Verify DNS records, SSL certificate expiry, "
                 "firewall/WAF rules, and that the host process is running.")
     s = r.status or 0
+    if s in (401, 403):
+        return ("Access denied. A key, token or firewall rule changed. If this endpoint should be "
+                "public to the monitor, allow the Cronus Sentinel user agent.")
+    if s == 405:
+        return ("Method not allowed. If this receiver normally answers 405 to the check, reply and "
+                "we'll mark 405 as healthy; otherwise a deploy changed which methods it accepts.")
     if s == 404:
         return ("Route not found. Confirm the latest deploy didn't rename or drop "
                 "this path, and that webhook URLs in Shopify/Stripe still match.")
@@ -255,69 +502,156 @@ def recommend_action(r: ProbeResult) -> str:
 # --------------------------------------------------------------------------- #
 # Alert formatting
 # --------------------------------------------------------------------------- #
-def format_incident(ep: Endpoint, r: ProbeResult, fails: int) -> str:
+@dataclass
+class Alert:
+    ep: Endpoint
+    kind: str                   # "incident", "reminder", "resolved", "test"
+    text: str                   # Telegram HTML
+
+    @property
+    def is_incident(self) -> bool:
+        return self.kind in ("incident", "reminder")
+
+
+def impact(r: ProbeResult) -> tuple[str, str]:
+    """(emoji, word) for the card header: is it down, or up but unhealthy?"""
+    s = r.status
+    if s is None or s >= 500 or s == 404:
+        return "🔴", "DOWN"
+    if r.error == "timeout":
+        return "🟠", "SLOW"
+    return "🟠", "DEGRADED"
+
+
+def esc(text: str) -> str:
+    """Escape for Telegram HTML (quotes don't need it, and leaving them keeps JSON readable)."""
+    return html.escape(text, quote=False)
+
+
+def footer(ep: Endpoint) -> str:
+    return f"<i>Cronus Sentinel · {esc(ep.client_id)}</i>"
+
+
+def format_incident(ep: Endpoint, r: ProbeResult, fails: int, st: dict[str, Any] | None = None,
+                    reminder: bool = False, now: datetime | None = None) -> str:
     """
     Telegram HTML. Telegram doesn't allow custom colours, so the 'dark' look
     comes from <pre> blocks, which render as a dark monospace panel in the
     Telegram dark theme, plus a restrained emoji severity marker.
+
+    Lines appear only when there is evidence for them, so the card never shows
+    an empty or guessed field.
     """
-    e = html.escape
-    status = str(r.status) if r.status is not None else "NO RESPONSE"
-    reason = f" ({r.error})" if r.error else ""
-    return (
-        "🔴 <b>CRONUS SENTINEL · INCIDENT</b>\n"
-        f"<b>{e(ep.endpoint_name)}</b> · <code>{e(ep.client_id)}</code>\n"
-        "<pre>"
-        f"TARGET    {e(ep.endpoint_name)}\n"
-        f"URL       {e(ep.target_url)}\n"
-        f"STATUS    {e(status + reason)}\n"
-        f"LATENCY   {r.latency_ms} ms (budget {ep.timeout_ms} ms)\n"
-        f"FAILURES  {fails} consecutive\n"
-        f"TIME      {e(r.checked_at)}"
-        "</pre>\n"
-        f"<b>Recommended action:</b> {e(recommend_action(r))}"
-    )
+    e, st = esc, st or {}
+    now = now or datetime.now(timezone.utc)
+    icon, word = impact(r)
+    if reminder:
+        word = f"STILL {word}"
+    sev = f" · {e(ep.severity.upper())}" if ep.severity else ""
+    since = parse_ts(st.get("down_since")) or parse_ts(r.checked_at)
+
+    rows = [("STATUS", status_text(r))]
+    if since:
+        rows.append(("SINCE", f"{fmt_when(since, ep.timezone, now)} ({fmt_duration(now - since)})"))
+    rows.append(("LAST OK", fmt_when(parse_ts(st.get("last_ok_at")), ep.timezone, now)
+                 if st.get("last_ok_at") else "none since monitoring began"))
+    rows.append(("FAILURES", f"{fails} consecutive checks"))
+    rows.append(("LATENCY", f"{r.latency_ms} ms (budget {ep.timeout_ms} ms)"))
+    if r.final_url:
+        rows.append(("ENDED AT", r.final_url))
+    if r.served_by:
+        rows.append(("SERVED BY", r.served_by))
+    if r.request_id:
+        rows.append(("REQ ID", r.request_id))
+    if r.error_detail:
+        rows.append(("ERROR", r.error_detail))
+    if r.body_excerpt:
+        rows.append(("BODY", r.body_excerpt))
+    panel = "\n".join(f"{k:<9} {e(v)}" for k, v in rows)
+
+    where, action = diagnose(r)
+    lines = [
+        f"{icon} <b>{word}</b> · <b>{e(ep.endpoint_name)}</b>{sev}",
+        f"<code>{e(ep.method)} {e(ep.target_url)}</code>",
+        f"<pre>{panel}</pre>",
+    ]
+    if where:
+        lines.append(f"<b>Where:</b> {e(where)}")
+    lines.append(f"<b>Next step:</b> {e(action)}")
+    lines.append(footer(ep))
+    return "\n".join(lines)
 
 
-def format_resolved(ep: Endpoint, r: ProbeResult, down_since: str) -> str:
-    e = html.escape
-    return (
-        "🟢 <b>CRONUS SENTINEL · RESOLVED</b>\n"
-        f"<b>{e(ep.endpoint_name)}</b> · <code>{e(ep.client_id)}</code>\n"
-        "<pre>"
-        f"URL       {e(ep.target_url)}\n"
-        f"STATUS    {r.status}\n"
-        f"LATENCY   {r.latency_ms} ms\n"
-        f"DOWN FROM {e(down_since)}\n"
-        f"UP AT     {e(r.checked_at)}"
-        "</pre>"
-    )
+def format_resolved(ep: Endpoint, r: ProbeResult, st: dict[str, Any],
+                    now: datetime | None = None) -> str:
+    """Recovery card: how long it was down and what the failure was, for the client's records."""
+    e = esc
+    now = now or datetime.now(timezone.utc)
+    since = parse_ts(st.get("down_since"))
+    up = parse_ts(r.checked_at) or now
+    rows = [("STATUS", status_text(r)), ("LATENCY", f"{r.latency_ms} ms")]
+    if since:
+        rows.append(("DOWNTIME", f"~{fmt_duration(up - since)}"))
+        rows.append(("FROM", fmt_when(since, ep.timezone, now)))
+        rows.append(("TO", fmt_when(up, ep.timezone, now)))
+    if st.get("failure_count"):
+        rows.append(("FAILED", f"{st['failure_count']} checks"))
+    if st.get("last_fail_status"):
+        rows.append(("CAUSE", st["last_fail_status"]))
+    panel = "\n".join(f"{k:<9} {e(str(v))}" for k, v in rows)
+    return "\n".join([
+        f"🟢 <b>RECOVERED</b> · <b>{e(ep.endpoint_name)}</b>",
+        f"<code>{e(ep.method)} {e(ep.target_url)}</code>",
+        f"<pre>{panel}</pre>",
+        "<i>Downtime is measured between checks, so the real outage may be slightly shorter.</i>",
+        footer(ep),
+    ])
+
+
+def link_buttons(ep: Endpoint) -> list[tuple[str, str]]:
+    return [(t, u) for t, u in (("Runbook", ep.runbook_url), ("Dashboard", ep.dashboard_url)) if u]
 
 
 def to_plain(html_text: str) -> str:
-    """Strip tags for Slack (Slack uses mrkdwn, not HTML)."""
-    import re
+    """Convert the Telegram HTML card to Slack mrkdwn."""
     text = re.sub(r"</?pre>", "```", html_text)
+    text = re.sub(r"</?b>", "*", text)
+    text = re.sub(r"</?i>", "_", text)
+    text = re.sub(r"</?code>", "`", text)
     text = re.sub(r"<[^>]+>", "", text)
-    return html.unescape(text)
+    text = html.unescape(text)
+    # Slack treats < > & as control characters, so escape them again.
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # --------------------------------------------------------------------------- #
 # Dispatch
 # --------------------------------------------------------------------------- #
-async def send_telegram(session: aiohttp.ClientSession, chat_id: str, text: str) -> bool:
+TELEGRAM_MAX = 4096
+
+
+async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Alert) -> bool:
+    text = alert.text
+    if len(text) > TELEGRAM_MAX:  # only a huge URL could do this; keep the card sendable
+        text = text[: TELEGRAM_MAX - 1] + "…"
     if DRY_RUN:
         if VERBOSE:
-            print(f"\n--- DRY RUN → Telegram chat {chat_id} ---\n{text}\n")
+            print(f"\n--- DRY RUN → Telegram chat {chat_id} [{alert.kind.upper()}] ---\n{text}")
+            for t, u in link_buttons(alert.ep):
+                print(f"[button] {t} → {u}")
+            print()
         else:
-            kind = "RESOLVED" if "RESOLVED" in text else "INCIDENT"
-            print(f"--- DRY RUN → Telegram: would send {kind} (set SENTINEL_VERBOSE_LOGS=1 to print it)")
+            print(f"--- DRY RUN → Telegram: would send {alert.kind.upper()} "
+                  "(set SENTINEL_VERBOSE_LOGS=1 to print it)")
         return True
     if not TELEGRAM_BOT_TOKEN:
         print("[alert] TELEGRAM_BOT_TOKEN not set — alert not sent", file=sys.stderr)
         return False
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-               "disable_web_page_preview": True}
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+                               "disable_web_page_preview": True}
+    buttons = link_buttons(alert.ep)
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": t, "url": u} for t, u in buttons]]}
     for attempt in range(3):  # Telegram occasionally 429s or blips
         try:
             async with session.post(TELEGRAM_API.format(token=TELEGRAM_BOT_TOKEN),
@@ -339,24 +673,30 @@ async def send_telegram(session: aiohttp.ClientSession, chat_id: str, text: str)
     return False
 
 
-async def send_slack(session: aiohttp.ClientSession, webhook: str, text: str) -> bool:
+def slack_text(alert: Alert) -> str:
+    links = "  ".join(f"<{u}|{t}>" for t, u in link_buttons(alert.ep))
+    return to_plain(alert.text) + (f"\n{links}" if links else "")
+
+
+async def send_slack(session: aiohttp.ClientSession, webhook: str, alert: Alert) -> bool:
     if not webhook:
         return True
     if DRY_RUN:
         if VERBOSE:
-            print(f"--- DRY RUN → Slack ---\n{to_plain(text)}\n")
+            print(f"--- DRY RUN → Slack [{alert.kind.upper()}] ---\n{slack_text(alert)}\n")
         return True
     try:
-        async with session.post(webhook, json={"text": to_plain(text)},
+        async with session.post(webhook, json={"text": slack_text(alert)},
                                 timeout=aiohttp.ClientTimeout(total=10)) as resp:
             return resp.status == 200
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return False
 
 
-async def dispatch(session: aiohttp.ClientSession, ep: Endpoint, text: str) -> bool:
-    tg, sl = await asyncio.gather(send_telegram(session, ep.telegram_chat_id, text),
-                                  send_slack(session, ep.slack_webhook_url, text))
+async def dispatch(session: aiohttp.ClientSession, alert: Alert) -> bool:
+    ep = alert.ep
+    tg, sl = await asyncio.gather(send_telegram(session, ep.telegram_chat_id, alert),
+                                  send_slack(session, ep.slack_webhook_url, alert))
     return tg and sl
 
 
@@ -364,9 +704,17 @@ async def dispatch(session: aiohttp.ClientSession, ep: Endpoint, text: str) -> b
 # Test alert (TEST_ALERT=1): proves delivery end to end without touching state
 # --------------------------------------------------------------------------- #
 def format_test(ep: Endpoint) -> str:
-    sample = ProbeResult(ok=False, status=500, latency_ms=412, checked_at=utc_now())
-    return ("🧪 <b>TEST ALERT</b> · nothing is down. A real incident card looks like this:\n\n"
-            + format_incident(ep, sample, 2))
+    """A fully filled sample card, so the client sees everything a real alert can carry."""
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    sample = ProbeResult(
+        ok=False, status=500, latency_ms=412, checked_at=now.strftime(TS_FORMAT),
+        reason="Internal Server Error", served_by="Cloudflare",
+        request_id="x-request-id 4f9c2e71-sample",
+        body_excerpt='{"error":"database connection refused"} (sample)')
+    st = {"down_since": (now - timedelta(minutes=3)).strftime(TS_FORMAT),
+          "last_ok_at": (now - timedelta(minutes=8)).strftime(TS_FORMAT)}
+    return ("🧪 <b>TEST ALERT</b> · nothing is down. This is sample data showing what a real "
+            "incident card looks like:\n\n" + format_incident(ep, sample, 2, st, now=now))
 
 
 async def send_test_alerts(endpoints: list[Endpoint]) -> int:
@@ -379,7 +727,8 @@ async def send_test_alerts(endpoints: list[Endpoint]) -> int:
             seen.add(dest)
             targets.append(ep)
     async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
-        sent = await asyncio.gather(*(dispatch(session, ep, format_test(ep)) for ep in targets))
+        sent = await asyncio.gather(*(dispatch(session, Alert(ep, "test", format_test(ep)))
+                                      for ep in targets))
     ok = sum(sent)
     line = f"{ok}/{len(targets)} test alert(s) delivered" + (" (dry run)" if DRY_RUN else "")
     if IN_ACTIONS:
@@ -427,7 +776,7 @@ async def run() -> int:
                 results[ep.key].append(r)
 
         # Apply results in order to each endpoint's counter, alert on transitions.
-        alerts = []
+        alerts: list[Alert] = []
         for ep in endpoints:
             st = state.setdefault(ep.key, {
                 "failure_count": ep.failure_count, "incident_open": False,
@@ -436,20 +785,24 @@ async def run() -> int:
             for r in results[ep.key]:
                 if r.ok:
                     if st["incident_open"]:
-                        alerts.append((ep, format_resolved(ep, r, st["down_since"] or "unknown")))
+                        alerts.append(Alert(ep, "resolved", format_resolved(ep, r, dict(st))))
                         resolved.append(idx[ep.key])
-                    st.update(failure_count=0, incident_open=False,
-                              down_since=None, last_alert_at_count=0)
+                    st.update(failure_count=0, incident_open=False, down_since=None,
+                              last_alert_at_count=0, last_fail_status=None)
+                    if not r.blocked:  # a challenge page says nothing about health
+                        st["last_ok_at"] = r.checked_at
                     continue
 
                 st["failure_count"] += 1
+                st["last_fail_status"] = status_text(r)
                 st["down_since"] = st["down_since"] or r.checked_at
                 n = st["failure_count"]
                 opening = not st["incident_open"] and n >= ep.failure_threshold
                 reminder = (st["incident_open"] and REMINDER_EVERY_N > 0
                             and n - st["last_alert_at_count"] >= REMINDER_EVERY_N)
                 if opening or reminder:
-                    alerts.append((ep, format_incident(ep, r, n)))
+                    kind = "incident" if opening else "reminder"
+                    alerts.append(Alert(ep, kind, format_incident(ep, r, n, st, reminder=not opening)))
                     if opening:
                         opened.append(idx[ep.key])
                     st["incident_open"] = True
@@ -469,14 +822,14 @@ async def run() -> int:
 
         sent: list[bool] = []
         if alerts:
-            sent = list(await asyncio.gather(*(dispatch(session, ep, txt) for ep, txt in alerts)))
+            sent = list(await asyncio.gather(*(dispatch(session, a) for a in alerts)))
             print(f"[sentinel] alerts: {sum(sent)}/{len(alerts)} delivered")
             # If an incident alert didn't go out, re-open the gate so the next
             # run tries again instead of silently swallowing the outage.
-            for (ep, txt), ok in zip(alerts, sent):
-                if not ok and "INCIDENT" in txt and state.get(ep.key, {}).get("incident_open"):
-                    state[ep.key]["incident_open"] = False
-                    state[ep.key]["last_alert_at_count"] = 0
+            for a, ok in zip(alerts, sent):
+                if not ok and a.is_incident and state.get(a.ep.key, {}).get("incident_open"):
+                    state[a.ep.key]["incident_open"] = False
+                    state[a.ep.key]["last_alert_at_count"] = 0
 
         # One machine-readable line per run for Jarvis's Ledger (Protocol 8).
         # Counts and endpoint indexes only — the log of a public repo is public;
