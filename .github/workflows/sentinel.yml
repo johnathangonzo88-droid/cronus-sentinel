@@ -1,0 +1,83 @@
+# Cronus Sentinel — scheduled endpoint monitor on GitHub Actions.
+#
+# DEPLOY (one-time):
+#   1. Push this repo to GitHub. Make it PUBLIC: public repos get free Actions
+#      minutes; a private repo at this cadence (~8,600 runs/month) blows past
+#      the 2,000 free minutes.
+#   2. Settings → Secrets and variables → Actions → New repository secret:
+#        TELEGRAM_BOT_TOKEN  = token from @BotFather
+#        ENDPOINTS_JSON      = the full contents of your real endpoints.json
+#      (Keep the committed endpoints.json as a harmless example. The secret
+#       wins at runtime, so client URLs and chat IDs never appear publicly.)
+#   3. Actions tab → "Cronus Sentinel" → Run workflow (dry_run = true) to test.
+#
+# KNOWN LIMITS (be honest with clients about these):
+#   - GitHub's minimum cron interval is 5 minutes, and scheduled runs are
+#     best-effort: they can start late or be dropped under load.
+#   - In public repos, scheduled workflows are auto-disabled after 60 days
+#     with no repository activity. Commit something (e.g. a changelog) monthly.
+
+name: Cronus Sentinel
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"          # every 5 minutes (UTC); GitHub's minimum
+  workflow_dispatch:                # manual "Run workflow" button
+    inputs:
+      dry_run:
+        description: "Print alerts to the log instead of sending them"
+        type: boolean
+        default: true
+
+# Never let two runs overlap — they'd race on the failure-counter state.
+concurrency:
+  group: cronus-sentinel
+  cancel-in-progress: false
+
+permissions:
+  contents: read                    # least privilege: read the code, nothing else
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4              # hard stop well before the next tick
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Runners are wiped after every job, so consecutive-failure counters are
+      # carried between runs through the Actions cache. restore-keys picks the
+      # newest "sentinel-state-*" entry; a fresh key is saved at the end.
+      - name: Restore failure-counter state
+        uses: actions/cache/restore@v4
+        with:
+          path: .sentinel/state.json
+          key: sentinel-state-${{ github.run_id }}
+          restore-keys: sentinel-state-
+
+      - name: Run sentinel
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ENDPOINTS_JSON: ${{ secrets.ENDPOINTS_JSON }}
+          # Scheduled runs send real alerts; manual runs follow the checkbox.
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          CONFIRM_DELAY_S: "20"     # re-probe failures once, 20 s later, in the same run
+          REMINDER_EVERY_N: "6"     # while still down, re-alert every 6 failed checks
+        run: python sentinel.py
+
+      - name: Save failure-counter state
+        if: always() && hashFiles('.sentinel/state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .sentinel/state.json
+          key: sentinel-state-${{ github.run_id }}-${{ github.run_attempt }}
