@@ -70,6 +70,7 @@ DRY_RUN = os.getenv("DRY_RUN", "").lower() in {"1", "true", "yes"}
 VERBOSE = os.getenv("SENTINEL_VERBOSE_LOGS", "").lower() in {"1", "true", "yes"}
 IN_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
+TEST_ALERT = os.getenv("TEST_ALERT", "").lower() in {"1", "true", "yes"}
 
 DEFAULT_TIMEOUT_MS = 3000
 DEFAULT_THRESHOLD = 2
@@ -353,6 +354,37 @@ async def dispatch(session: aiohttp.ClientSession, ep: Endpoint, text: str) -> b
 
 
 # --------------------------------------------------------------------------- #
+# Test alert (TEST_ALERT=1): proves delivery end to end without touching state
+# --------------------------------------------------------------------------- #
+def format_test(ep: Endpoint) -> str:
+    sample = ProbeResult(ok=False, status=500, latency_ms=412, checked_at=utc_now())
+    return ("🧪 <b>TEST ALERT</b> · nothing is down. A real incident card looks like this:\n\n"
+            + format_incident(ep, sample, 2))
+
+
+async def send_test_alerts(endpoints: list[Endpoint]) -> int:
+    """One sample card per alert destination (Telegram chat / Slack webhook)."""
+    seen: set[tuple[str, str]] = set()
+    targets = []
+    for ep in endpoints:
+        dest = (ep.telegram_chat_id, ep.slack_webhook_url)
+        if dest not in seen:
+            seen.add(dest)
+            targets.append(ep)
+    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+        sent = await asyncio.gather(*(dispatch(session, ep, format_test(ep)) for ep in targets))
+    ok = sum(sent)
+    line = f"{ok}/{len(targets)} test alert(s) delivered" + (" (dry run)" if DRY_RUN else "")
+    if IN_ACTIONS:
+        print(f"::notice title=cronus-test-alert::{line}")
+        if ok < len(targets):
+            print(f"::error title=cronus-test-alert::{len(targets) - ok} test alert(s) failed")
+    else:
+        print(f"[test] {line}")
+    return 0 if ok == len(targets) else 1
+
+
+# --------------------------------------------------------------------------- #
 # Main run
 # --------------------------------------------------------------------------- #
 async def run() -> int:
@@ -361,6 +393,9 @@ async def run() -> int:
     if not endpoints:
         print("[sentinel] no enabled endpoints — nothing to do")
         return 0
+
+    if TEST_ALERT:
+        return await send_test_alerts(endpoints)
 
     idx = {ep.key: i for i, ep in enumerate(endpoints)}
     cfg_hash = keys_hash([ep.key for ep in endpoints])
