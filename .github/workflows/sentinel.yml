@@ -11,18 +11,25 @@
 #       wins at runtime, so client URLs and chat IDs never appear publicly.)
 #   3. Actions tab → "Cronus Sentinel" → Run workflow (dry_run = true) to test.
 #
+# TIMING:
+#   GitHub's own schedule is best-effort and in practice fires every ~15-20
+#   minutes, not every 5. So the real 5-minute beat comes from a tiny
+#   Cloudflare Worker ("cronus-ticker", cron */5) that calls this workflow's
+#   workflow_dispatch API with dry_run=false. The schedule below is only a
+#   backup in case the ticker stops. Overlapping runs queue (see concurrency).
+#
 # KNOWN LIMITS (be honest with clients about these):
-#   - GitHub's minimum cron interval is 5 minutes, and scheduled runs are
-#     best-effort: they can start late or be dropped under load.
+#   - A dispatched run usually starts within a minute, but GitHub can still
+#     queue jobs during incidents.
 #   - In public repos, scheduled workflows are auto-disabled after 60 days
-#     with no repository activity. Commit something (e.g. a changelog) monthly.
+#     with no repository activity (the ticker is not affected).
 
 name: Cronus Sentinel
 
 on:
   schedule:
-    - cron: "*/5 * * * *"          # every 5 minutes (UTC); GitHub's minimum
-  workflow_dispatch:                # manual "Run workflow" button
+    - cron: "*/15 * * * *"         # backup only; the Cloudflare ticker drives the 5-minute beat
+  workflow_dispatch:                # used by the ticker (dry_run=false) and the manual button
     inputs:
       dry_run:
         description: "Print alerts to the log instead of sending them"
@@ -69,7 +76,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ENDPOINTS_JSON: ${{ secrets.ENDPOINTS_JSON }}
-          # Scheduled runs send real alerts; manual runs follow the checkbox.
+          # Scheduled and ticker runs send real alerts; manual runs follow the checkbox (default dry).
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
           CONFIRM_DELAY_S: "20"     # re-probe failures once, 20 s later, in the same run
           REMINDER_EVERY_N: "6"     # while still down, re-alert every 6 failed checks
