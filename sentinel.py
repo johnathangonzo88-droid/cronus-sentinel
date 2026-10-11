@@ -628,6 +628,11 @@ def to_plain(html_text: str) -> str:
 # Dispatch
 # --------------------------------------------------------------------------- #
 TELEGRAM_MAX = 4096
+TELEGRAM_HINTS = {
+    401: "The bot token is wrong or was revoked: update the TELEGRAM_BOT_TOKEN secret.",
+    400: "Usually a wrong telegram_chat_id in ENDPOINTS_JSON, or the bot isn't in that group.",
+    403: "The bot was removed from the group or blocked: add it back to the group.",
+}
 
 
 async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Alert) -> bool:
@@ -666,6 +671,13 @@ async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Ale
                 # Never print the token; the body is safe to log.
                 where = chat_id if VERBOSE else "<chat hidden>"
                 print(f"[alert] Telegram {resp.status} for {where}: {body[:300]}", file=sys.stderr)
+                if IN_ACTIONS:  # surface Telegram's reason on the run page (no chat id, no token)
+                    try:
+                        why = json.loads(body).get("description", "")
+                    except (json.JSONDecodeError, AttributeError):
+                        why = ""
+                    hint = TELEGRAM_HINTS.get(resp.status, "")
+                    print(f"::warning title=cronus-telegram::Telegram {resp.status}: {why[:150]}. {hint}")
                 return False
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             print(f"[alert] Telegram send error ({type(exc).__name__}), attempt {attempt + 1}", file=sys.stderr)
