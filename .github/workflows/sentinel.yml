@@ -35,6 +35,10 @@ on:
         description: "Print alerts to the log instead of sending them"
         type: boolean
         default: true
+      test_alert:
+        description: "Send one sample incident card to every alert channel, then stop (no checks)"
+        type: boolean
+        default: false
 
 # Never let two runs overlap — they'd race on the failure-counter state.
 concurrency:
@@ -78,6 +82,7 @@ jobs:
           ENDPOINTS_JSON: ${{ secrets.ENDPOINTS_JSON }}
           # Scheduled and ticker runs send real alerts; manual runs follow the checkbox (default dry).
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert && '1' || '0' }}
           CONFIRM_DELAY_S: "20"     # re-probe failures once, 20 s later, in the same run
           REMINDER_EVERY_N: "6"     # while still down, re-alert every 6 failed checks
         run: python sentinel.py
