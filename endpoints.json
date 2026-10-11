@@ -1,0 +1,32 @@
+{
+  "$schema": "./endpoints.schema.json",
+  "version": 1,
+  "endpoints": [
+    {
+      "client_id": "acme-agency",
+      "endpoint_name": "Storefront Checkout API",
+      "target_url": "https://httpbin.org/status/200",
+      "telegram_chat_id": "-1001234567890",
+      "failure_count": 0
+    },
+    {
+      "client_id": "acme-agency",
+      "endpoint_name": "Shopify Orders Webhook Receiver",
+      "target_url": "https://httpbin.org/status/200",
+      "telegram_chat_id": "-1001234567890",
+      "failure_count": 0,
+      "method": "HEAD",
+      "timeout_ms": 3000,
+      "failure_threshold": 2
+    },
+    {
+      "client_id": "northwind-saas",
+      "endpoint_name": "Public API Health",
+      "target_url": "https://httpbin.org/delay/1",
+      "telegram_chat_id": "-1009876543210",
+      "failure_count": 0,
+      "expected_status": [200],
+      "slack_webhook_url": ""
+    }
+  ]
+}
