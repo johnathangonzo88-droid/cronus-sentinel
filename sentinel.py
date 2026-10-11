@@ -108,6 +108,7 @@ class ProbeResult:
     latency_ms: int
     error: str = ""             # "timeout", "connection: ...", or ""
     checked_at: str = ""
+    blocked: bool = False       # a bot-protection challenge answered instead of the app
 
 
 REQUIRED = ("client_id", "endpoint_name", "target_url", "telegram_chat_id")
@@ -204,6 +205,12 @@ async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semap
                 await resp.read()  # full body counts toward latency
                 latency = int((time.perf_counter() - start) * 1000)
                 status = resp.status
+                # Cloudflare bot protection answers with a challenge page instead of
+                # the app. That says nothing about the endpoint's health, so it is not
+                # an outage alert; it is reported separately so the owner can fix access.
+                if resp.headers.get("cf-mitigated", "").lower() == "challenge":
+                    return ProbeResult(True, status, latency, "blocked by bot protection",
+                                       utc_now(), blocked=True)
                 if ep.expected_status:
                     ok = status in ep.expected_status
                 else:
@@ -451,7 +458,7 @@ async def run() -> int:
             last = results[ep.key][-1]
             st.update(last_status=last.status, last_latency_ms=last.latency_ms,
                       last_checked=last.checked_at)
-            mark = "OK  " if last.ok else "FAIL"
+            mark = "BLKD" if last.blocked else ("OK  " if last.ok else "FAIL")
             print(f"[{mark}] {label(ep, idx):<40} status={last.status} "
                   f"latency={last.latency_ms}ms fails={st['failure_count']}")
 
@@ -475,14 +482,18 @@ async def run() -> int:
         # Counts and endpoint indexes only — the log of a public repo is public;
         # Jarvis maps indexes back to names with the keys it exported (cfg).
         failing = [idx[ep.key] for ep in endpoints if not results[ep.key][-1].ok]
+        blocked = [idx[ep.key] for ep in endpoints if results[ep.key][-1].blocked]
         summary = {
-            "v": 1, "cfg": cfg_hash, "n": len(endpoints), "failing": failing,
+            "v": 1, "cfg": cfg_hash, "n": len(endpoints), "failing": failing, "blocked": blocked,
             "opened": opened, "resolved": resolved,
             "alerts_sent": sum(sent), "alerts_failed": len(sent) - sum(sent),
         }
         line = json.dumps(summary, separators=(",", ":"))
         if IN_ACTIONS:
             print(f"::notice title=cronus-summary::{line}")
+            if blocked:
+                print(f"::warning title=cronus-blocked::{len(blocked)} endpoint(s) answered with a bot-protection "
+                      "challenge, so their health is unknown. Allow the monitor through (see ONBOARDING.md).")
             if summary["alerts_failed"]:
                 print(f"::warning title=cronus-alert-failed::{summary['alerts_failed']} alert(s) failed to deliver")
         else:
