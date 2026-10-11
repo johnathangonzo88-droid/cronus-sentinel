@@ -44,6 +44,14 @@ Actions → Cronus Sentinel → latest run → the `cronus-summary` line. `n` sh
 the new endpoint count and `failing` should be `[]`. If a URL is failing on day one,
 fix the config (usually `expected_status`) before the client sees an alert.
 
+If `blocked` lists an endpoint, the client's bot protection (usually Cloudflare) answered
+with a challenge page instead of their app, so Cronus can't see its health. Fixes, easiest first:
+- Point the check at a URL that bot protection doesn't cover (an API or webhook path, or a
+  health-check URL on a subdomain that isn't proxied).
+- Cloudflare Pro or higher: a WAF custom rule that skips bot checks for the Cronus user agent.
+- Cloudflare Free: Bot Fight Mode can't be bypassed per request; the client would have to turn
+  it off (Security → Bots) or use one of the options above.
+
 ## 5. Send the test alert (the client watches it arrive)
 
 Actions → Cronus Sentinel → **Run workflow** → untick `dry_run`, tick `test_alert` → Run.
