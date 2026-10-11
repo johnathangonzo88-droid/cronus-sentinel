@@ -50,6 +50,7 @@ import html
 import json
 import os
 import re
+import ssl
 import sys
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,13 @@ VERBOSE = os.getenv("SENTINEL_VERBOSE_LOGS", "").lower() in {"1", "true", "yes"}
 IN_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
 TEST_ALERT = os.getenv("TEST_ALERT", "").lower() in {"1", "true", "yes"}
+SEND_WEEKLY = os.getenv("SEND_WEEKLY", "").lower() in {"1", "true", "yes"}   # preview now, keep counters
+WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "0"))              # 0 = Monday
+WEEKLY_HOUR_UTC = int(os.getenv("WEEKLY_HOUR_UTC", "14"))   # 14 UTC = 9 AM Chicago (summer)
+CERT_WARN_DAYS = sorted({int(x) for x in os.getenv("CERT_WARN_DAYS", "14,3").split(",") if x.strip()},
+                        reverse=True)
+CERT_CHECK_EVERY_H = float(os.getenv("CERT_CHECK_EVERY_H", "12"))
+META_KEY = "__meta__"   # run-level state, kept alongside the per-endpoint entries
 
 DEFAULT_TIMEOUT_MS = 3000
 DEFAULT_THRESHOLD = 2
@@ -101,6 +109,7 @@ class Endpoint:
     timezone: str = ""                        # optional IANA zone for local times, e.g. "America/Chicago"
     runbook_url: str = ""                     # optional; becomes a button on the alert
     dashboard_url: str = ""                   # optional; becomes a button on the alert
+    weekly_summary: bool = True               # include in the Monday report
 
     @property
     def key(self) -> str:
@@ -505,8 +514,9 @@ def recommend_action(r: ProbeResult) -> str:
 @dataclass
 class Alert:
     ep: Endpoint
-    kind: str                   # "incident", "reminder", "resolved", "test"
+    kind: str                   # incident, reminder, resolved, certificate, weekly, test
     text: str                   # Telegram HTML
+    undo: dict[str, Any] = field(default_factory=dict)  # state to restore if delivery fails
 
     @property
     def is_incident(self) -> bool:
@@ -753,6 +763,237 @@ async def send_test_alerts(endpoints: list[Endpoint]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Certificate expiry warnings
+# --------------------------------------------------------------------------- #
+async def fetch_cert(host: str, port: int) -> dict[str, Any] | None:
+    """The server's verified certificate (expiry + issuer), or None if it can't be read.
+    An invalid or expired certificate fails verification here; the normal probe
+    already alerts on that as a TLS failure, so it isn't double-reported."""
+    ctx = ssl.create_default_context()
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ctx, server_hostname=host), timeout=10)
+    except (OSError, asyncio.TimeoutError, ssl.SSLError):
+        return None
+    try:
+        cert = writer.get_extra_info("peercert") or {}
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except (OSError, ssl.SSLError):
+            pass
+    if not cert.get("notAfter"):
+        return None
+    issuer = {k: v for part in cert.get("issuer", ()) for k, v in part}
+    name = issuer.get("organizationName", "")
+    cn = issuer.get("commonName", "")
+    expires = datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), timezone.utc)
+    return {"expires": expires.strftime(TS_FORMAT),
+            "issuer": f"{name} ({cn})" if name and cn and cn != name else (name or cn)}
+
+
+def cert_threshold(days_left: float, already: list[int]) -> int | None:
+    """The tightest warning threshold just crossed that hasn't been sent for this certificate."""
+    due = [t for t in CERT_WARN_DAYS if days_left <= t and t not in already]
+    return min(due) if due else None
+
+
+def format_cert_warning(ep: Endpoint, host: str, cert: dict[str, Any], now: datetime) -> str:
+    e = esc
+    expires = parse_ts(cert["expires"]) or now
+    days = max(0, (expires - now).total_seconds() / 86400)
+    rows = [("HOST", host), ("EXPIRES", fmt_when(expires, ep.timezone, now)),
+            ("IN", f"{int(days)} days" if days >= 1 else f"{fmt_duration(expires - now)}")]
+    if cert.get("issuer"):
+        rows.append(("ISSUER", cert["issuer"]))
+    panel = "\n".join(f"{k:<9} {e(v)}" for k, v in rows)
+    return "\n".join([
+        f"🟡 <b>CERTIFICATE EXPIRES SOON</b> · <b>{e(ep.endpoint_name)}</b>",
+        f"<code>{e(ep.target_url)}</code>",
+        f"<pre>{panel}</pre>",
+        "<b>Next step:</b> Renew the certificate, or check that auto-renewal (certbot, or your "
+        "host's managed SSL) is running. Once it lapses, browsers and webhook senders refuse to connect.",
+        footer(ep),
+    ])
+
+
+async def check_certs(endpoints: list[Endpoint], state: dict[str, Any],
+                      now: datetime) -> list[Alert]:
+    """Read each HTTPS host's certificate at most every CERT_CHECK_EVERY_H hours, and
+    warn each endpoint once per threshold (e.g. 14 and 3 days) per certificate."""
+    from urllib.parse import urlsplit
+    targets: dict[tuple[str, int], list[Endpoint]] = {}
+    for ep in endpoints:
+        u = urlsplit(ep.target_url)
+        if u.scheme == "https" and u.hostname:
+            targets.setdefault((u.hostname, u.port or 443), []).append(ep)
+
+    due = []
+    for hp, eps in targets.items():
+        last = parse_ts(state[eps[0].key].get("cert_checked"))
+        if last is None or now - last >= timedelta(hours=CERT_CHECK_EVERY_H):
+            due.append(hp)
+    certs = await asyncio.gather(*(fetch_cert(h, p) for h, p in due))
+
+    alerts = []
+    for (host, port), cert in zip(due, certs):
+        for ep in targets[(host, port)]:
+            st = state[ep.key]
+            st["cert_checked"] = now.strftime(TS_FORMAT)
+            if not cert:
+                continue
+            if st.get("cert_expires") != cert["expires"]:  # new or renewed certificate
+                st.update(cert_expires=cert["expires"], cert_warned=[])
+            st["cert_issuer"] = cert["issuer"]
+            expires = parse_ts(cert["expires"])
+            if not expires:
+                continue
+            t = cert_threshold((expires - now).total_seconds() / 86400, st.get("cert_warned", []))
+            if t is not None:
+                prev = list(st.get("cert_warned", []))
+                # Mark every looser threshold too, so a cert first seen at 2 days left
+                # doesn't trigger a "14 days" warning on the next check.
+                st["cert_warned"] = sorted(set(prev) | {x for x in CERT_WARN_DAYS if x >= t})
+                alerts.append(Alert(ep, "certificate", format_cert_warning(ep, host, cert, now),
+                                    undo={"cert_warned": prev}))  # restored if delivery fails
+    return alerts
+
+
+# --------------------------------------------------------------------------- #
+# Weekly summary
+# --------------------------------------------------------------------------- #
+def new_week(now: datetime) -> dict[str, Any]:
+    return {"since": now.strftime(TS_FORMAT), "checks": 0, "ok": 0, "lat_sum": 0, "lat_n": 0,
+            "incidents": 0, "down_s": 0}
+
+
+def record_week(st: dict[str, Any], last: ProbeResult, opened: bool,
+                recovered_after_s: float | None, now: datetime) -> None:
+    """Add one run's outcome to the endpoint's weekly counters."""
+    w = st.setdefault("week", new_week(now))
+    if last.blocked:  # health unknown; leave it out of uptime
+        return
+    w["checks"] += 1
+    if last.ok:
+        w["ok"] += 1
+        w["lat_sum"] += last.latency_ms
+        w["lat_n"] += 1
+    if opened:
+        w["incidents"] += 1
+    if recovered_after_s:
+        w["down_s"] += int(recovered_after_s)
+
+
+def weekly_due(meta: dict[str, Any], now: datetime) -> bool:
+    """True on the first run at/after the configured weekday and hour, once per week."""
+    if now.weekday() != WEEKLY_DAY or now.hour < WEEKLY_HOUR_UTC:
+        return False
+    return meta.get("weekly_sent_on") != now.date().isoformat()
+
+
+def fmt_pct(ok: int, total: int) -> str:
+    if not total:
+        return "—"
+    p = 100 * ok / total
+    return "100%" if ok == total else f"{min(p, 99.99):.2f}%".replace(".00%", "%")
+
+
+def format_weekly(eps: list[Endpoint], state: dict[str, Any], now: datetime) -> str:
+    e = esc
+    first = eps[0]
+    starts = [parse_ts(state[ep.key].get("week", {}).get("since")) for ep in eps]
+    start = min((s for s in starts if s), default=now)
+    blocks, down_now = [], 0
+    for ep in eps:
+        st = state[ep.key]
+        w = st.get("week") or new_week(now)
+        down_s = w["down_s"]
+        if st.get("incident_open"):
+            down_now += 1
+            since = parse_ts(st.get("down_since"))
+            if since:
+                down_s += int((now - since).total_seconds())
+        avg = f"avg {round(w['lat_sum'] / w['lat_n'])} ms" if w["lat_n"] else "avg —"
+        inc = f"{w['incidents']} incident" + ("" if w["incidents"] == 1 else "s")
+        if down_s:
+            inc += f", ~{fmt_duration(timedelta(seconds=down_s))} down"
+        lines = [e(ep.endpoint_name),
+                 f"  uptime {fmt_pct(w['ok'], w['checks'])} · {w['checks']:,} checks",
+                 f"  {avg} · {inc}"]
+        exp = parse_ts(st.get("cert_expires"))
+        if exp:
+            lines.append(f"  certificate valid {max(0, (exp - now).days)} more days")
+        blocks.append("\n".join(lines))
+
+    if down_now:
+        status = f"⚠️ {down_now} endpoint{'s are' if down_now > 1 else ' is'} down right now."
+    else:
+        status = "All endpoints were healthy at the time of this report."
+    period = f"{start:%b %d}".replace(" 0", " ") + " – " + f"{now:%b %d}".replace(" 0", " ")
+    return "\n".join([
+        f"📊 <b>WEEKLY REPORT</b> · <b>{e(first.client_id)}</b>",
+        f"{period} · checked every 5 minutes",
+        "<pre>" + "\n\n".join(blocks) + "</pre>",
+        status,
+        "<i>Uptime counts checks that passed. A single failed check that passed on the "
+        "20-second re-check counts as up.</i>",
+        footer(first),
+    ])
+
+
+def weekly_groups(endpoints: list[Endpoint]) -> dict[str, list[Endpoint]]:
+    """Endpoints grouped by alert destination (one report each), keyed by a hash so the
+    state file never stores chat ids or webhook URLs in the clear."""
+    groups: dict[str, list[Endpoint]] = {}
+    for ep in endpoints:
+        if ep.weekly_summary:
+            dest = hashlib.sha256(f"{ep.telegram_chat_id}|{ep.slack_webhook_url}".encode()).hexdigest()[:12]
+            groups.setdefault(dest, []).append(ep)
+    return groups
+
+
+async def send_weekly(session: aiohttp.ClientSession, endpoints: list[Endpoint],
+                      state: dict[str, Any], now: datetime, preview: bool) -> None:
+    """Send due weekly reports. A preview (manual run) sends to everyone and keeps the counters;
+    the scheduled send resets each client's counters only once their report is delivered,
+    so a failed delivery is retried on the next run instead of being lost."""
+    meta = state.setdefault(META_KEY, {})
+    sent_on = meta.setdefault("weekly_sent_on", {})
+    today = now.date().isoformat()
+    groups = weekly_groups(endpoints)
+    if not preview:
+        if now.weekday() != WEEKLY_DAY or now.hour < WEEKLY_HOUR_UTC:
+            return
+        groups = {d: eps for d, eps in groups.items() if sent_on.get(d) != today}
+    if not groups:
+        return
+    for eps in groups.values():  # an endpoint with no history yet still gets a line
+        for ep in eps:
+            state.setdefault(ep.key, {}).setdefault("week", new_week(now))
+    items = list(groups.items())
+    ok = await asyncio.gather(*(dispatch(session, Alert(eps[0], "weekly", format_weekly(eps, state, now)))
+                                for _, eps in items))
+    if not preview:
+        for (dest, eps), delivered in zip(items, ok):
+            if delivered:
+                sent_on[dest] = today
+                for ep in eps:
+                    state[ep.key]["week"] = new_week(now)
+        for dest in [d for d in sent_on if d not in weekly_groups(endpoints)]:
+            del sent_on[dest]
+    line = f"{sum(ok)}/{len(ok)} weekly report(s) delivered" + (" (preview)" if preview else "") \
+        + (" (dry run)" if DRY_RUN else "")
+    if IN_ACTIONS:
+        print(f"::notice title=cronus-weekly::{line}")
+        if sum(ok) < len(ok):
+            print(f"::warning title=cronus-weekly::{len(ok) - sum(ok)} weekly report(s) failed; "
+                  "retrying on the next run")
+    else:
+        print(f"[weekly] {line}")
+
+
+# --------------------------------------------------------------------------- #
 # Main run
 # --------------------------------------------------------------------------- #
 async def run() -> int:
@@ -764,6 +1005,12 @@ async def run() -> int:
 
     if TEST_ALERT:
         return await send_test_alerts(endpoints)
+
+    now = datetime.now(timezone.utc)
+    if SEND_WEEKLY:
+        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+            await send_weekly(session, endpoints, state, now, preview=True)
+        return 0
 
     idx = {ep.key: i for i, ep in enumerate(endpoints)}
     cfg_hash = keys_hash([ep.key for ep in endpoints])
@@ -794,8 +1041,12 @@ async def run() -> int:
                 "failure_count": ep.failure_count, "incident_open": False,
                 "down_since": None, "last_alert_at_count": 0,
             })
+            opened_now, recovered_after = False, None
             for r in results[ep.key]:
                 if r.ok:
+                    since, up = parse_ts(st["down_since"]), parse_ts(r.checked_at)
+                    if st["incident_open"] and since and up:
+                        recovered_after = (up - since).total_seconds()
                     if st["incident_open"]:
                         alerts.append(Alert(ep, "resolved", format_resolved(ep, r, dict(st))))
                         resolved.append(idx[ep.key])
@@ -817,19 +1068,21 @@ async def run() -> int:
                     alerts.append(Alert(ep, kind, format_incident(ep, r, n, st, reminder=not opening)))
                     if opening:
                         opened.append(idx[ep.key])
+                        opened_now = True
                     st["incident_open"] = True
                     st["last_alert_at_count"] = n
 
             last = results[ep.key][-1]
             st.update(last_status=last.status, last_latency_ms=last.latency_ms,
                       last_checked=last.checked_at)
+            record_week(st, last, opened_now, recovered_after, now)
             mark = "BLKD" if last.blocked else ("OK  " if last.ok else "FAIL")
             print(f"[{mark}] {label(ep, idx):<40} status={last.status} "
                   f"latency={last.latency_ms}ms fails={st['failure_count']}")
 
         # Drop state for endpoints removed from config.
         live = {ep.key for ep in endpoints}
-        for k in [k for k in state if k not in live]:
+        for k in [k for k in state if k not in live and k != META_KEY]:
             del state[k]
 
         sent: list[bool] = []
@@ -842,6 +1095,18 @@ async def run() -> int:
                 if not ok and a.is_incident and state.get(a.ep.key, {}).get("incident_open"):
                     state[a.ep.key]["incident_open"] = False
                     state[a.ep.key]["last_alert_at_count"] = 0
+
+        # Certificate warnings and the weekly report are informational: they are sent
+        # separately and kept out of the Jarvis incident counts below.
+        cert_alerts = await check_certs(endpoints, state, now)
+        if cert_alerts:
+            cert_ok = list(await asyncio.gather(*(dispatch(session, a) for a in cert_alerts)))
+            for a, ok in zip(cert_alerts, cert_ok):
+                if not ok:  # let the next check try this warning again
+                    state[a.ep.key].update(a.undo, cert_checked=None)
+            line = f"{sum(cert_ok)}/{len(cert_ok)} certificate warning(s) delivered"
+            print(f"::notice title=cronus-certs::{line}" if IN_ACTIONS else f"[certs] {line}")
+        await send_weekly(session, endpoints, state, now, preview=False)
 
         # One machine-readable line per run for Jarvis's Ledger (Protocol 8).
         # Counts and endpoint indexes only — the log of a public repo is public;

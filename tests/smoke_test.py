@@ -37,6 +37,7 @@ async def leaky(_):     # an error body that contains a secret, which must be re
 
 def run_sentinel(tmp: Path, cfg: dict) -> str:
     env = {**os.environ, "DRY_RUN": "1", "CONFIRM_DELAY_S": "0", "SENTINEL_VERBOSE_LOGS": "1",
+           "WEEKLY_DAY": "7",  # never: keeps the Monday report out of these assertions
            "ENDPOINTS_JSON": json.dumps(cfg), "STATE_FILE": str(tmp / "state.json")}
     out = subprocess.run([sys.executable, str(ROOT / "sentinel.py")], env=env,
                          capture_output=True, text=True, timeout=60)
@@ -96,7 +97,7 @@ async def main():
         # Default (non-verbose) logs, as on public GitHub: no names, URLs or chat ids.
         flip["recovered"] = False
         quiet_tmp = Path(tempfile.mkdtemp())
-        env = {**os.environ, "DRY_RUN": "1", "CONFIRM_DELAY_S": "0", "GITHUB_ACTIONS": "true",
+        env = {**os.environ, "DRY_RUN": "1", "CONFIRM_DELAY_S": "0", "GITHUB_ACTIONS": "true", "WEEKLY_DAY": "7",
                "ENDPOINTS_JSON": json.dumps(cfg), "STATE_FILE": str(quiet_tmp / "s.json")}
         env.pop("SENTINEL_VERBOSE_LOGS", None)
         quiet = lambda: subprocess.run([sys.executable, str(ROOT / "sentinel.py")], env=env,

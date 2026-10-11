@@ -51,6 +51,16 @@ file with `ops_export_endpoints`. Paste the whole file into the
 A probe fails on HTTP 5xx, HTTP 404, connection errors, or latency over
 `timeout_ms` (default 3000). Counters persist between runs in the Actions cache.
 
+### Certificate warnings and the weekly report
+
+- **Certificates**: twice a day each HTTPS host's certificate is read. The client gets one
+  🟡 warning 14 days and one 3 days before it expires (`CERT_WARN_DAYS`). Renewing resets them.
+- **Weekly report**: every Monday at 14:00 UTC, each client's alert channel gets one 📊 report:
+  uptime, checks, average latency, incidents and downtime per endpoint, days left on each
+  certificate, and whether anything is down right now. Set `"weekly_summary": false` on an
+  endpoint to leave it out. To send one now (for a demo or a pilot check-in), run the workflow
+  with **weekly_report** ticked and `dry_run` unticked; this doesn't reset the week.
+
 ### What an incident card tells the client
 
 Every field appears only when the check actually saw it, so nothing is guessed:
@@ -79,5 +89,6 @@ when running locally.
 ```bash
 pip install -r requirements.txt
 python tests/smoke_test.py          # offline, no network needed
+python tests/test_reports.py        # weekly report + certificate warnings
 DRY_RUN=1 SENTINEL_VERBOSE_LOGS=1 python sentinel.py   # real probes, alerts printed not sent
 ```

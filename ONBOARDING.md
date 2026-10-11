@@ -72,7 +72,8 @@ Every alert channel gets one sample card marked TEST. The run's annotation says
 
 ## 7. Day 12 and day 14
 
-- Day 12: send a short summary (checks run, incidents caught, if any) and the payment link.
+- Day 12: run the workflow with **weekly_report** ticked (and `dry_run` unticked) so the client
+  gets a fresh report in their channel, then send the payment link with a line pointing to it.
 - Day 14: paid → keep running. Not paid → remove their entries from `ENDPOINTS_JSON` the
   same day and tell them it's off. Never keep monitoring a client who hasn't agreed to pay.
 

@@ -39,6 +39,10 @@ on:
         description: "Send one sample incident card to every alert channel, then stop (no checks). Always sends for real, even if dry_run is ticked."
         type: boolean
         default: false
+      weekly_report:
+        description: "Send this week's report to every client now, then stop (no checks). Counters are kept; the Monday report still goes out."
+        type: boolean
+        default: false
 
 # Never let two runs overlap — they'd race on the failure-counter state.
 concurrency:
@@ -50,15 +54,15 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04          # pinned; ubuntu-latest moves to Ubuntu 26 on 2026-10-19
     timeout-minutes: 4              # hard stop well before the next tick
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
@@ -70,7 +74,7 @@ jobs:
       # carried between runs through the Actions cache. restore-keys picks the
       # newest "sentinel-state-*" entry; a fresh key is saved at the end.
       - name: Restore failure-counter state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .sentinel/state.json
           key: sentinel-state-${{ github.run_id }}
@@ -84,13 +88,17 @@ jobs:
           # A test alert always really sends: it's harmless, and sending it is its whole point.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_alert && '1' || '0' }}
           TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert && '1' || '0' }}
+          SEND_WEEKLY: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_report && '1' || '0' }}
+          WEEKLY_DAY: "0"           # Monday
+          WEEKLY_HOUR_UTC: "14"     # 9 AM Chicago in summer, 8 AM in winter
+          CERT_WARN_DAYS: "14,3"    # certificate warnings this many days before expiry
           CONFIRM_DELAY_S: "20"     # re-probe failures once, 20 s later, in the same run
           REMINDER_EVERY_N: "6"     # while still down, re-alert every 6 failed checks
         run: python sentinel.py
 
       - name: Save failure-counter state
         if: always() && hashFiles('.sentinel/state.json') != ''
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .sentinel/state.json
           key: sentinel-state-${{ github.run_id }}-${{ github.run_attempt }}

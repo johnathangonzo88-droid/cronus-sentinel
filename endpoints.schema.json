@@ -2,31 +2,111 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Cronus Sentinel endpoint config",
   "type": "object",
-  "required": ["endpoints"],
+  "required": [
+    "endpoints"
+  ],
   "properties": {
-    "version": { "type": "integer", "const": 1 },
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
     "endpoints": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["client_id", "endpoint_name", "target_url", "telegram_chat_id"],
+        "required": [
+          "client_id",
+          "endpoint_name",
+          "target_url",
+          "telegram_chat_id"
+        ],
         "additionalProperties": false,
         "properties": {
-          "client_id":         { "type": "string", "description": "Your internal client slug, e.g. acme-agency" },
-          "endpoint_name":     { "type": "string", "description": "Human label shown in alerts; unique per client" },
-          "target_url":        { "type": "string", "pattern": "^https?://" },
-          "telegram_chat_id":  { "type": ["string", "integer"], "description": "Client's Telegram group/channel ID (groups start with -100)" },
-          "failure_count":     { "type": "integer", "minimum": 0, "default": 0, "description": "Seed only; the live counter is kept in .sentinel/state.json" },
-          "failure_threshold": { "type": "integer", "minimum": 1, "default": 2 },
-          "method":            { "type": "string", "enum": ["GET", "HEAD", "POST", "OPTIONS"], "default": "GET" },
-          "timeout_ms":        { "type": "integer", "minimum": 250, "maximum": 30000, "default": 3000 },
-          "expected_status":   { "type": "array", "items": { "type": "integer" }, "description": "If set, only these codes count as healthy" },
-          "slack_webhook_url": { "type": "string", "description": "Optional Slack incoming-webhook URL" },
-          "enabled":           { "type": "boolean", "default": true },
-          "severity":          { "type": "string", "maxLength": 20, "description": "Optional label shown in the alert header, e.g. critical" },
-          "timezone":          { "type": "string", "description": "Optional IANA time zone; alerts show the client's local time next to UTC, e.g. America/Chicago" },
-          "runbook_url":       { "type": "string", "pattern": "^https://", "description": "Optional; shown as a Runbook button on alerts" },
-          "dashboard_url":     { "type": "string", "pattern": "^https://", "description": "Optional; shown as a Dashboard button on alerts" }
+          "client_id": {
+            "type": "string",
+            "description": "Your internal client slug, e.g. acme-agency"
+          },
+          "endpoint_name": {
+            "type": "string",
+            "description": "Human label shown in alerts; unique per client"
+          },
+          "target_url": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "telegram_chat_id": {
+            "type": [
+              "string",
+              "integer"
+            ],
+            "description": "Client's Telegram group/channel ID (groups start with -100)"
+          },
+          "failure_count": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Seed only; the live counter is kept in .sentinel/state.json"
+          },
+          "failure_threshold": {
+            "type": "integer",
+            "minimum": 1,
+            "default": 2
+          },
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "HEAD",
+              "POST",
+              "OPTIONS"
+            ],
+            "default": "GET"
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 250,
+            "maximum": 30000,
+            "default": 3000
+          },
+          "expected_status": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "If set, only these codes count as healthy"
+          },
+          "slack_webhook_url": {
+            "type": "string",
+            "description": "Optional Slack incoming-webhook URL"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true
+          },
+          "severity": {
+            "type": "string",
+            "maxLength": 20,
+            "description": "Optional label shown in the alert header, e.g. critical"
+          },
+          "timezone": {
+            "type": "string",
+            "description": "Optional IANA time zone; alerts show the client's local time next to UTC, e.g. America/Chicago"
+          },
+          "runbook_url": {
+            "type": "string",
+            "pattern": "^https://",
+            "description": "Optional; shown as a Runbook button on alerts"
+          },
+          "dashboard_url": {
+            "type": "string",
+            "pattern": "^https://",
+            "description": "Optional; shown as a Dashboard button on alerts"
+          },
+          "weekly_summary": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include this endpoint in the client's Monday report"
+          }
         }
       }
     }
