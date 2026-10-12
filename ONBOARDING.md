@@ -81,3 +81,16 @@ Every alert channel gets one sample card marked TEST. The run's annotation says
 
 Remove their entries from `ENDPOINTS_JSON`, confirm `n` dropped in the next run's summary,
 and ask them to remove the bot from their group.
+
+## Paid clients (automatic)
+
+The `cronus-forms` Worker (`forms/worker.js`) listens to Stripe at `/api/stripe/webhook` and emails
+cronussignals@gmail.com:
+
+- **New Pro Agency client** when someone pays. Stripe has already sent them to /endpoints; their
+  list arrives as a separate "Endpoint list" email. Continue from step 3.
+- **No endpoint list yet**, once, if nothing has arrived from their paying email after 48 hours.
+- **Payment failed** on a renewal. Stripe retries and emails them; nothing to do yet.
+- **Cancelled** when the subscription ends. Do the offboarding steps below that day.
+
+Records live in the D1 database `cronus-onboarding` (`forms/schema.sql`). Tests: `cd forms && node test.mjs`.

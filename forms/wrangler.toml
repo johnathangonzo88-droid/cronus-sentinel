@@ -1,0 +1,21 @@
+name = "cronus-forms"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+
+routes = [{ pattern = "cronussignals.com/api/*", zone_name = "cronussignals.com" }]
+
+[[send_email]]
+name = "MAILER"
+destination_address = "cronussignals@gmail.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cronus-onboarding"
+database_id = "b98c6f0b-7ac3-4268-b675-d1e934b61882"
+
+[triggers]
+crons = ["7 14 * * *"]
+
+# Keep the variables and secrets already set in the dashboard on every deploy:
+# SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, STRIPE_WEBHOOK_SECRET. Never put their values in this file.
+keep_vars = true
