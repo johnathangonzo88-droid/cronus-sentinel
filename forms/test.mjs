@@ -268,4 +268,30 @@ await test('Slack install still redirects to Slack; other paths 404', async () =
   assert.equal((await W.fetch(new Request('https://cronussignals.com/api/nope'), env)).status, 404);
 });
 
+await test('heartbeats: registered ids record check-ins, unknown ids are refused', async () => {
+  const { env } = makeEnv();
+  env.HEARTBEAT_READ_TOKEN = 'readtok';
+  const id = 'hb_' + 'a1'.repeat(12);
+  env.DB.sql.prepare('insert into heartbeats (id, label, created_at) values (?, ?, ?)').run(id, 'acme / orders zap', 1);
+  const ping = (hid, method = 'POST') => W.fetch(new Request(`https://cronussignals.com/api/hb/${hid}`, { method }), env);
+  const status = (hid, tok = 'readtok') => W.fetch(new Request(`https://cronussignals.com/api/hb/${hid}/status`,
+    { headers: tok ? { authorization: `Bearer ${tok}` } : {} }), env);
+
+  let s = await (await status(id)).json();
+  assert.equal(s.last_ping, null);
+  assert.equal((await ping(id)).status, 200);
+  assert.equal((await ping(id, 'GET')).status, 200);  // within 30 s: accepted, counted once
+  s = await (await status(id)).json();
+  assert.ok(s.last_ping > 0);
+  assert.equal(s.pings, 1);
+
+  assert.equal((await ping('hb_' + 'b2'.repeat(12))).status, 404);   // not registered
+  assert.equal((await ping('not-an-id')).status, 404);
+  assert.equal((await ping(id, 'DELETE')).status, 405);
+  assert.equal((await status(id, 'wrong')).status, 401);
+  assert.equal((await status(id, null)).status, 401);
+  delete env.HEARTBEAT_READ_TOKEN;
+  assert.equal((await status(id, 'readtok')).status, 401);           // no token configured: closed
+});
+
 console.log(`\nall ${n} checks passed`);

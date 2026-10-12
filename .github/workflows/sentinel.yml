@@ -7,6 +7,7 @@
 #   2. Settings → Secrets and variables → Actions → New repository secret:
 #        TELEGRAM_BOT_TOKEN  = token from @BotFather
 #        ENDPOINTS_JSON      = the full contents of your real endpoints.json
+#        HEARTBEAT_READ_TOKEN = long random string; also set on the cronus-forms Worker
 #      (Keep the committed endpoints.json as a harmless example. The secret
 #       wins at runtime, so client URLs and chat IDs never appear publicly.)
 #   3. Actions tab → "Cronus Sentinel" → Run workflow (dry_run = true) to test.
@@ -41,6 +42,10 @@ on:
         default: false
       weekly_report:
         description: "Send this week's report to every client now, then stop (no checks). Counters are kept; the Monday report still goes out."
+        type: boolean
+        default: false
+      monthly_report:
+        description: "Send every client's branded monthly report now, then stop (no checks). Always sends for real. Counters are kept; the report on the 1st still goes out."
         type: boolean
         default: false
 
@@ -86,9 +91,11 @@ jobs:
           ENDPOINTS_JSON: ${{ secrets.ENDPOINTS_JSON }}
           # Scheduled and ticker runs send real alerts; manual runs follow the checkbox (default dry).
           # A test alert always really sends: it's harmless, and sending it is its whole point.
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_alert && '1' || '0' }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_alert && !inputs.monthly_report && '1' || '0' }}
           TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert && '1' || '0' }}
           SEND_WEEKLY: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_report && '1' || '0' }}
+          SEND_MONTHLY: ${{ github.event_name == 'workflow_dispatch' && inputs.monthly_report && '1' || '0' }}
+          HEARTBEAT_READ_TOKEN: ${{ secrets.HEARTBEAT_READ_TOKEN }}   # same value as the cronus-forms Worker secret
           WEEKLY_DAY: "0"           # Monday
           WEEKLY_HOUR_UTC: "14"     # 9 AM Chicago in summer, 8 AM in winter
           CERT_WARN_DAYS: "14,3"    # certificate warnings this many days before expiry

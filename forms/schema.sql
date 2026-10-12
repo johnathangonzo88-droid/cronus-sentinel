@@ -31,3 +31,15 @@ create table if not exists stripe_events (
   received_at   integer not null,
   processed_at  integer
 );
+
+-- Heartbeats: one row per monitored automation (Zap, Make scenario, cron job).
+-- Register one:  insert into heartbeats (id, label, created_at)
+--                values ('hb_<24 hex>', '<client> / <automation>', <ms since epoch>);
+-- (python sentinel.py new-heartbeat prints a fresh id and the exact statement.)
+create table if not exists heartbeats (
+  id          text primary key,           -- hb_ + 24 hex characters
+  label       text,                       -- for the operator only; never shown publicly
+  created_at  integer not null,           -- ms since epoch
+  last_ping   integer,                    -- ms since epoch; null until the first check-in
+  pings       integer not null default 0
+);

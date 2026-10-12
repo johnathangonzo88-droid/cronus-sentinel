@@ -37,7 +37,53 @@ Tell Jarvis ("add Acme as a pilot…"); it keeps the client list and writes the
 file with `ops_export_endpoints`. Paste the whole file into the
 `ENDPOINTS_JSON` secret. Required per endpoint: `client_id`, `endpoint_name`,
 `target_url`, `telegram_chat_id`. Optional: `method`, `timeout_ms`,
-`failure_threshold`, `expected_status`, `slack_webhook_url`, `enabled`.
+`failure_threshold`, `expected_status`, `slack_webhook_url`, `enabled`, plus the content
+checks, heartbeat and report fields below. `endpoints.schema.json` documents every field.
+
+### Content checks: "200 OK, but broken"
+
+A status code alone misses the worst failures: the server answers 200 but the app behind it
+is broken. Any of these on an endpoint turns that into a 🟠 BROKEN RESPONSE incident:
+
+| Field | Fails when | Example |
+|---|---|---|
+| `json_rules` | a JSON value is missing, empty, wrong, or out of range | `[{"path": "data.orders", "rule": "not_empty"}]` |
+| `body_contains` | a phrase that should be there isn't | `["id=\"lead-form\""]` |
+| `body_not_contains` | a phrase that shouldn't be there is | `["maintenance mode"]` |
+| `error_keywords` | the page shows a common app error (fatal error, stack trace, "something went wrong"…) | `true` |
+| `min_body_bytes` | the body is smaller than this | `500` |
+| `size_drop_pct` | the body shrinks this % below its usual size (learned over ~1 hour) | `60` |
+
+`json_rules` paths look like `data.items`, `$.data.items[0].id`; rules are `exists`,
+`not_empty` (default), `equals`, `not_equals`, `min`, `max` (on a list, min/max compare its length).
+Never point a check at something that creates real orders or leads: use a read or health
+endpoint, a test mode, or a heartbeat.
+
+### Heartbeats: Zapier, Make and cron jobs
+
+No-code automations can't be pinged; they run on their own. So they check in with us instead:
+
+1. `python sentinel.py new-heartbeat` prints a fresh id, the ping URL, and the line to register it.
+2. Register it: Cloudflare → D1 → `cronus-onboarding` → Console → paste the `insert` line.
+3. The client adds a final "Webhooks by Zapier" / Make HTTP step that calls the ping URL.
+4. Add the printed entry to `ENDPOINTS_JSON`, with `expect_every_min` set to how often it runs.
+
+If no check-in arrives within `expect_every_min` plus 10% grace (at least 5 minutes), the client
+gets a 🔴 MISSED CHECK-IN card. If *our* status API can't be read, the endpoint is marked unknown,
+never down, so a Cronus problem never pages a client. Needs the `HEARTBEAT_READ_TOKEN` secret on
+both the `cronus-forms` Worker and this repo.
+
+### Branded monthly report (white-label)
+
+On the 1st of each month (14:00 UTC) each client gets one self-contained HTML page in their
+Telegram group: uptime, checks run, issues detected, total downtime, a per-integration table and
+an incident log. It carries the agency's name, colour and logo, not Cronus, so the agency can
+forward it or print it to PDF for their client. Slack-only channels get the numbers as text.
+
+Set on any endpoint of the client: `client_name`, `report_brand`, `report_color` (`#0e7490`),
+`report_logo_url`, and optionally `revenue_per_hour`, which adds a clearly labelled estimate of
+sales at risk during downtime. `"monthly_report": false` leaves an endpoint out. To send one now,
+run the workflow with **monthly_report** ticked (counters are kept).
 
 ## How alerting works
 
@@ -90,5 +136,7 @@ when running locally.
 pip install -r requirements.txt
 python tests/smoke_test.py          # offline, no network needed
 python tests/test_reports.py        # weekly report + certificate warnings
+python tests/test_payload.py        # content checks, heartbeats, monthly report
+(cd forms && node test.mjs)         # cronus-forms Worker, incl. heartbeat routes
 DRY_RUN=1 SENTINEL_VERBOSE_LOGS=1 python sentinel.py   # real probes, alerts printed not sent
 ```

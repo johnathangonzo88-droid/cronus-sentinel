@@ -12,6 +12,12 @@ What one run does
      - HTTP 5xx, HTTP 404 (or any status not in `expected_status`, if set)
      - connection errors (DNS, TLS, refused)
      - total latency > timeout_ms (default 3000 ms)
+     - a content check, when configured: body_contains / body_not_contains,
+       error_keywords, json_rules, min_body_bytes, or a sudden size drop
+       (size_drop_pct). This catches "200 OK, but broken" responses.
+   Heartbeat endpoints (kind = "heartbeat") work the other way round: a Zap,
+   Make scenario or cron job pings https://cronussignals.com/api/hb/<id> on
+   every run, and the endpoint FAILS when no ping arrived in expect_every_min.
 4. Endpoints that failed are re-probed once after CONFIRM_DELAY_S seconds
    (default 20). So "2 consecutive failures" can be confirmed inside ONE run,
    instead of waiting for the next cron tick (which GitHub may delay).
@@ -31,6 +37,10 @@ CONFIRM_DELAY_S      optional; seconds before re-probing failures (default 20, 0
 REMINDER_EVERY_N     optional; re-alert every N failed checks while down (default 0 = never)
 DRY_RUN              optional; "1" prints alerts instead of sending them
 MAX_CONCURRENCY      optional; parallel probes (default 50)
+HEARTBEAT_READ_TOKEN required for heartbeat endpoints; same value as the cronus-forms
+                     Worker secret of that name
+SEND_MONTHLY         optional; "1" sends every client's branded monthly report now
+REPORTS_DIR          optional; where dry runs write report HTML (default .sentinel/reports)
 SENTINEL_VERBOSE_LOGS optional; "1" prints client names, URLs and alert text
                      to the log. Leave OFF on GitHub: logs of a public repo
                      are public, so by default endpoints appear as #index only.
@@ -81,7 +91,20 @@ WEEKLY_HOUR_UTC = int(os.getenv("WEEKLY_HOUR_UTC", "14"))   # 14 UTC = 9 AM Chic
 CERT_WARN_DAYS = sorted({int(x) for x in os.getenv("CERT_WARN_DAYS", "14,3").split(",") if x.strip()},
                         reverse=True)
 CERT_CHECK_EVERY_H = float(os.getenv("CERT_CHECK_EVERY_H", "12"))
+SEND_MONTHLY = os.getenv("SEND_MONTHLY", "").lower() in {"1", "true", "yes"}  # preview now, keep counters
+MONTHLY_HOUR_UTC = int(os.getenv("MONTHLY_HOUR_UTC", os.getenv("WEEKLY_HOUR_UTC", "14")))
+REPORTS_DIR = Path(os.getenv("REPORTS_DIR", ".sentinel/reports"))
+HEARTBEAT_STATUS_URL = os.getenv("HEARTBEAT_STATUS_URL", "https://cronussignals.com/api/hb/{id}/status")
+HEARTBEAT_PING_URL = os.getenv("HEARTBEAT_PING_URL", "https://cronussignals.com/api/hb/{id}")
+HEARTBEAT_READ_TOKEN = os.getenv("HEARTBEAT_READ_TOKEN", "").strip()
+SIZE_MIN_SAMPLES = int(os.getenv("SIZE_MIN_SAMPLES", "12"))   # ~1 hour of history before drift alerts
 META_KEY = "__meta__"   # run-level state, kept alongside the per-endpoint entries
+
+# Phrases that mean "the server answered, but the app behind it failed" (error_keywords: true).
+ERROR_KEYWORDS = ("fatal error", "uncaught exception", "traceback (most recent call last)",
+                  "stack trace", "internal server error", "something went wrong",
+                  "service unavailable", "database error", "connection refused",
+                  "upstream connect error")
 
 DEFAULT_TIMEOUT_MS = 3000
 DEFAULT_THRESHOLD = 2
@@ -110,6 +133,24 @@ class Endpoint:
     runbook_url: str = ""                     # optional; becomes a button on the alert
     dashboard_url: str = ""                   # optional; becomes a button on the alert
     weekly_summary: bool = True               # include in the Monday report
+    # Content checks (all optional; any one failing makes the check fail)
+    body_contains: list[str] = field(default_factory=list)      # every phrase must appear
+    body_not_contains: list[str] = field(default_factory=list)  # none may appear
+    error_keywords: bool = False              # also fail on common app-error phrases
+    json_rules: list[dict] = field(default_factory=list)        # [{"path": "data.items", "rule": "not_empty"}]
+    min_body_bytes: int = 0                   # a smaller body is a failure
+    size_drop_pct: int = 0                    # fail if the body shrinks this % below its usual size
+    # Heartbeats: the client's automation pings us; silence is the failure
+    kind: str = "http"                        # "http" or "heartbeat"
+    heartbeat_id: str = ""                    # hb_<24 hex>, registered in the cronus-forms D1 table
+    expect_every_min: int = 0                 # how often the automation normally runs
+    # Branded monthly report (taken from the first endpoint of a client that sets them)
+    monthly_report: bool = True
+    client_name: str = ""                     # shown on the report; default client_id
+    report_brand: str = ""                    # the agency's name, e.g. "Northwind Studio"
+    report_color: str = ""                    # accent colour, e.g. "#1f6feb"
+    report_logo_url: str = ""                 # https URL of the agency logo
+    revenue_per_hour: float = 0               # optional; turns downtime into an estimate of sales at risk
 
     @property
     def key(self) -> str:
@@ -133,9 +174,30 @@ class ProbeResult:
     platform_error: str = ""    # e.g. Vercel's x-vercel-error code
     body_excerpt: str = ""      # first line of the response body, redacted and trimmed
     final_url: str = ""         # set when redirects led somewhere other than target_url
+    check_failed: str = ""      # which content/heartbeat check failed, in plain words
+    body_bytes: int = 0         # response size, for size-drift tracking
 
 
 REQUIRED = ("client_id", "endpoint_name", "target_url", "telegram_chat_id")
+HEARTBEAT_ID_RE = re.compile(r"hb_[0-9a-f]{24}")
+RULES = ("exists", "not_empty", "equals", "not_equals", "min", "max")
+
+
+def validate_rules(rules: Any) -> str:
+    """'' if json_rules is well formed, otherwise what's wrong with it."""
+    if not isinstance(rules, list):
+        return "json_rules must be a list"
+    for n, rule in enumerate(rules):
+        if not isinstance(rule, dict) or not str(rule.get("path", "")).strip():
+            return f"json_rules[{n}] needs a \"path\""
+        kind = rule.get("rule", "not_empty")
+        if kind not in RULES:
+            return f"json_rules[{n}]: rule must be one of {', '.join(RULES)}"
+        if kind in ("equals", "not_equals", "min", "max") and "value" not in rule:
+            return f"json_rules[{n}]: rule \"{kind}\" needs a \"value\""
+        if kind in ("min", "max") and not isinstance(rule["value"], (int, float)):
+            return f"json_rules[{n}]: \"{kind}\" needs a number"
+    return ""
 
 
 def load_endpoints() -> list[Endpoint]:
@@ -158,6 +220,22 @@ def load_endpoints() -> list[Endpoint]:
     endpoints, problems = [], []
     allowed = set(Endpoint.__dataclass_fields__)
     for i, item in enumerate(items):
+        if str(item.get("kind", "http")) == "heartbeat":
+            hb = str(item.get("heartbeat_id", ""))
+            if not HEARTBEAT_ID_RE.fullmatch(hb):
+                problems.append(f"endpoint #{i}: heartbeat_id must look like hb_ followed by 24 hex characters")
+                continue
+            if int(item.get("expect_every_min") or 0) < 5:
+                problems.append(f"endpoint #{i}: expect_every_min must be 5 or more")
+                continue
+            item = {**item, "target_url": HEARTBEAT_STATUS_URL.format(id=hb), "method": "GET"}
+        elif item.get("kind", "http") != "http":
+            problems.append(f"endpoint #{i}: kind must be \"http\" or \"heartbeat\"")
+            continue
+        rule_problem = validate_rules(item.get("json_rules") or [])
+        if rule_problem:
+            problems.append(f"endpoint #{i}: {rule_problem}")
+            continue
         missing = [k for k in REQUIRED if not item.get(k)]
         if missing:
             problems.append(f"endpoint #{i}: missing {', '.join(missing)}")
@@ -176,7 +254,7 @@ def load_endpoints() -> list[Endpoint]:
             except (ZoneInfoNotFoundError, ValueError):
                 problems.append(f"endpoint #{i}: unknown timezone (use an IANA name like America/Chicago)")
                 continue
-        bad_link = [k for k in ("runbook_url", "dashboard_url")
+        bad_link = [k for k in ("runbook_url", "dashboard_url", "report_logo_url")
                     if clean.get(k) and not str(clean[k]).startswith("https://")]
         if bad_link:
             problems.append(f"endpoint #{i}: {', '.join(bad_link)} must start with https://")
@@ -265,7 +343,9 @@ CLOUDFLARE_NAMES = {520: "Web Server Returned an Unknown Error", 521: "Web Serve
 
 
 def status_text(r: "ProbeResult") -> str:
-    """'500 Internal Server Error', 'NO RESPONSE (dns)', '200 OK, but too slow'."""
+    """'500 Internal Server Error', 'NO RESPONSE (dns)', '200 OK, over budget'."""
+    if r.error == "heartbeat":
+        return "NO CHECK-IN"
     if r.status is None:
         return f"NO RESPONSE ({r.error})" if r.error else "NO RESPONSE"
     reason = r.reason if r.reason and r.reason.lower() != "unknown" else ""
@@ -277,6 +357,8 @@ def status_text(r: "ProbeResult") -> str:
     text = f"{r.status} {reason}".strip()
     if r.error == "timeout":
         text += ", over budget"
+    elif r.error == "payload":
+        text += ", wrong content"
     return text
 
 
@@ -355,6 +437,8 @@ def label(ep: "Endpoint", idx: dict[str, int]) -> str:
 # --------------------------------------------------------------------------- #
 async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semaphore) -> ProbeResult:
     """One HTTP check. Never raises — every outcome becomes a ProbeResult."""
+    if ep.kind == "heartbeat":
+        return await probe_heartbeat(session, ep, sem)
     timeout = aiohttp.ClientTimeout(total=ep.timeout_ms / 1000)
     async with sem:
         start = time.perf_counter()
@@ -375,10 +459,15 @@ async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semap
                 else:
                     ok = status != 404 and status < 500
                 # Slow-but-successful still counts as a failure past the budget.
-                error = ""
+                error, problem = "", ""
                 if latency > ep.timeout_ms:
                     ok, error = False, "timeout"
-                result = ProbeResult(ok, status, latency, error, utc_now(), reason=resp.reason or "")
+                elif ok:  # reachable and fast: now check what it actually said
+                    problem = check_payload(ep, body)
+                    if problem:
+                        ok, error = False, "payload"
+                result = ProbeResult(ok, status, latency, error, utc_now(), reason=resp.reason or "",
+                                     check_failed=problem, body_bytes=len(body))
                 if not ok:
                     h = resp.headers
                     result.served_by = detect_platform(h)
@@ -396,6 +485,155 @@ async def probe(session: aiohttp.ClientSession, ep: Endpoint, sem: asyncio.Semap
             latency = int((time.perf_counter() - start) * 1000)
             return ProbeResult(False, None, latency, classify_error(exc), utc_now(),
                                error_detail=error_text(exc))
+
+
+# --------------------------------------------------------------------------- #
+# Content checks ("200 OK, but broken")
+# --------------------------------------------------------------------------- #
+_MISSING = object()
+_PATH_RE = re.compile(r"\[(\d+)\]|[^.\[\]]+")
+
+
+def json_get(doc: Any, path: str) -> Any:
+    """Follow 'data.items[0].id' (a leading '$' or '$.' is allowed). _MISSING if absent."""
+    path = path.strip()
+    if path.startswith("$"):
+        path = path[1:]
+    cur = doc
+    for m in _PATH_RE.finditer(path):
+        if m.group(1) is not None:
+            i = int(m.group(1))
+            if not isinstance(cur, list) or i >= len(cur):
+                return _MISSING
+            cur = cur[i]
+        else:
+            key = m.group(0)
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            elif isinstance(cur, list) and key.isdigit() and int(key) < len(cur):
+                cur = cur[int(key)]
+            else:
+                return _MISSING
+    return cur
+
+
+def _short(v: Any, limit: int = 40) -> str:
+    text = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else f'"{v}"'
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def check_rule(doc: Any, rule: dict) -> str:
+    """'' when the rule holds, otherwise a short plain-language reason."""
+    path, kind = str(rule["path"]), rule.get("rule", "not_empty")
+    v = json_get(doc, path)
+    if v is _MISSING:
+        return f"{path} is missing from the response"
+    if kind == "not_empty" and v in (None, "", [], {}):
+        return f"{path} is empty"
+    if kind == "equals" and v != rule["value"]:
+        return f"{path} is {_short(v)}, expected {_short(rule['value'])}"
+    if kind == "not_equals" and v == rule["value"]:
+        return f"{path} is {_short(v)}"
+    if kind in ("min", "max"):
+        n = len(v) if isinstance(v, (list, dict, str)) else v
+        if isinstance(n, bool) or not isinstance(n, (int, float)):
+            return f"{path} is {_short(v)}, expected a number or a list"
+        if kind == "min" and n < rule["value"]:
+            return f"{path} is {n}, expected at least {rule['value']}"
+        if kind == "max" and n > rule["value"]:
+            return f"{path} is {n}, expected at most {rule['value']}"
+    return ""
+
+
+def check_payload(ep: Endpoint, body: bytes) -> str:
+    """'' if the body passes every configured content check, else the first failure."""
+    if ep.min_body_bytes and len(body) < ep.min_body_bytes:
+        return f"response was {len(body):,} bytes, expected at least {ep.min_body_bytes:,}"
+    if not (ep.body_contains or ep.body_not_contains or ep.error_keywords or ep.json_rules):
+        return ""
+    text = body.decode("utf-8", "replace")
+    low = text.lower()
+    for phrase in ep.body_contains:
+        if phrase.lower() not in low:
+            return f"expected text {_short(phrase)} is missing"
+    banned = list(ep.body_not_contains) + (list(ERROR_KEYWORDS) if ep.error_keywords else [])
+    for phrase in banned:
+        if phrase.lower() in low:
+            return f"response contains {_short(phrase)}"
+    if ep.json_rules:
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return "response is not valid JSON"
+        for rule in ep.json_rules:
+            why = check_rule(doc, rule)
+            if why:
+                return why
+    return ""
+
+
+def apply_size_drift(ep: Endpoint, st: dict[str, Any], r: ProbeResult) -> None:
+    """Fail a healthy-looking result whose body suddenly shrank (e.g. a product feed that
+    now returns an empty list with a 200). Learns the usual size from healthy checks."""
+    if not ep.size_drop_pct or not r.ok or r.blocked or ep.kind != "http":
+        return
+    base, n = st.get("size_base"), st.get("size_n", 0)
+    if base and n >= SIZE_MIN_SAMPLES and r.body_bytes < base * (1 - ep.size_drop_pct / 100):
+        r.ok, r.error = False, "payload"
+        r.check_failed = f"response was {r.body_bytes:,} bytes; it is usually about {round(base):,}"
+        return
+    st["size_base"] = r.body_bytes if not base else base * 0.9 + r.body_bytes * 0.1
+    st["size_n"] = n + 1
+
+
+# --------------------------------------------------------------------------- #
+# Heartbeats (no-code automations check in with us)
+# --------------------------------------------------------------------------- #
+def fmt_every(minutes: int) -> str:
+    if minutes % 1440 == 0:
+        d = minutes // 1440
+        return "day" if d == 1 else f"{d} days"
+    if minutes % 60 == 0:
+        h = minutes // 60
+        return "hour" if h == 1 else f"{h} hours"
+    return f"{minutes} min"
+
+
+def heartbeat_grace_min(ep: Endpoint) -> int:
+    """Allowed lateness: 10% of the interval, at least one 5-minute check."""
+    return max(5, round(ep.expect_every_min * 0.1))
+
+
+async def probe_heartbeat(session: aiohttp.ClientSession, ep: Endpoint,
+                          sem: asyncio.Semaphore) -> ProbeResult:
+    """Ask the cronus-forms Worker when this heartbeat last checked in.
+    Trouble on OUR side (Worker down, token missing) is reported as 'health unknown',
+    never as the client's outage."""
+    headers = {"Authorization": f"Bearer {HEARTBEAT_READ_TOKEN}"} if HEARTBEAT_READ_TOKEN else {}
+    async with sem:
+        start = time.perf_counter()
+        try:
+            async with session.get(ep.target_url, headers=headers,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                latency = int((time.perf_counter() - start) * 1000)
+                if resp.status != 200:
+                    return ProbeResult(True, resp.status, latency, "heartbeat status unavailable",
+                                       utc_now(), blocked=True)
+                data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return ProbeResult(True, None, int((time.perf_counter() - start) * 1000),
+                               "heartbeat status unavailable", utc_now(), blocked=True)
+    last_ms = data.get("last_ping") if isinstance(data, dict) else None
+    if not last_ms:
+        return ProbeResult(True, 200, latency, "awaiting first heartbeat", utc_now(), blocked=True)
+    last = datetime.fromtimestamp(float(last_ms) / 1000, timezone.utc)
+    age = datetime.now(timezone.utc) - last
+    allowed = timedelta(minutes=ep.expect_every_min + heartbeat_grace_min(ep))
+    if age <= allowed:
+        return ProbeResult(True, 200, latency, "", utc_now())
+    return ProbeResult(False, 200, latency, "heartbeat", utc_now(),
+                       check_failed=f"last check-in {fmt_duration(age)} ago; "
+                                    f"it normally runs every {fmt_every(ep.expect_every_min)}")
 
 
 def classify_error(exc: BaseException) -> str:
@@ -464,6 +702,14 @@ def diagnose(r: ProbeResult) -> tuple[str, str]:
 
 def recommend_action(r: ProbeResult) -> str:
     """Plain-language next step for the developer on call."""
+    if r.error == "heartbeat":
+        return ("The scheduled automation hasn't checked in. Open its run history (Zapier, Make or "
+                "the cron log): look for a paused scenario, an expired app connection, or a step "
+                "that started failing.")
+    if r.error == "payload":
+        return ("The server answered, but the response failed a content check. Check the latest "
+                "deploy, expired API keys or tokens for upstream services, and code paths that "
+                "return empty data instead of an error.")
     if r.error == "timeout":
         if r.status is not None:
             return (f"The endpoint answered but took {r.latency_ms} ms. Check slow queries, "
@@ -526,6 +772,10 @@ class Alert:
 def impact(r: ProbeResult) -> tuple[str, str]:
     """(emoji, word) for the card header: is it down, or up but unhealthy?"""
     s = r.status
+    if r.error == "heartbeat":
+        return "🔴", "MISSED CHECK-IN"
+    if r.error == "payload":
+        return "🟠", "BROKEN RESPONSE"
     if s is None or s >= 500 or s == 404:
         return "🔴", "DOWN"
     if r.error == "timeout":
@@ -536,6 +786,13 @@ def impact(r: ProbeResult) -> tuple[str, str]:
 def esc(text: str) -> str:
     """Escape for Telegram HTML (quotes don't need it, and leaving them keeps JSON readable)."""
     return html.escape(text, quote=False)
+
+
+def target_line(ep: Endpoint) -> str:
+    """What the card says is being watched. Heartbeats never show our status URL."""
+    if ep.kind == "heartbeat":
+        return f"<code>heartbeat · expected every {esc(fmt_every(ep.expect_every_min))}</code>"
+    return f"<code>{esc(ep.method)} {esc(ep.target_url)}</code>"
 
 
 def footer(ep: Endpoint) -> str:
@@ -565,8 +822,11 @@ def format_incident(ep: Endpoint, r: ProbeResult, fails: int, st: dict[str, Any]
         rows.append(("SINCE", f"{fmt_when(since, ep.timezone, now)} ({fmt_duration(now - since)})"))
     rows.append(("LAST OK", fmt_when(parse_ts(st.get("last_ok_at")), ep.timezone, now)
                  if st.get("last_ok_at") else "none since monitoring began"))
+    if r.check_failed:
+        rows.append(("CHECK", r.check_failed))
     rows.append(("FAILURES", f"{fails} consecutive checks"))
-    rows.append(("LATENCY", f"{r.latency_ms} ms (budget {ep.timeout_ms} ms)"))
+    if ep.kind == "http":
+        rows.append(("LATENCY", f"{r.latency_ms} ms (budget {ep.timeout_ms} ms)"))
     if r.final_url:
         rows.append(("ENDED AT", r.final_url))
     if r.served_by:
@@ -582,7 +842,7 @@ def format_incident(ep: Endpoint, r: ProbeResult, fails: int, st: dict[str, Any]
     where, action = diagnose(r)
     lines = [
         f"{icon} <b>{word}</b> · <b>{e(ep.endpoint_name)}</b>{sev}",
-        f"<code>{e(ep.method)} {e(ep.target_url)}</code>",
+        target_line(ep),
         f"<pre>{panel}</pre>",
     ]
     if where:
@@ -611,7 +871,7 @@ def format_resolved(ep: Endpoint, r: ProbeResult, st: dict[str, Any],
     panel = "\n".join(f"{k:<9} {e(str(v))}" for k, v in rows)
     return "\n".join([
         f"🟢 <b>RECOVERED</b> · <b>{e(ep.endpoint_name)}</b>",
-        f"<code>{e(ep.method)} {e(ep.target_url)}</code>",
+        target_line(ep),
         f"<pre>{panel}</pre>",
         "<i>Downtime is measured between checks, so the real outage may be slightly shorter.</i>",
         footer(ep),
@@ -826,7 +1086,7 @@ async def check_certs(endpoints: list[Endpoint], state: dict[str, Any],
     targets: dict[tuple[str, int], list[Endpoint]] = {}
     for ep in endpoints:
         u = urlsplit(ep.target_url)
-        if u.scheme == "https" and u.hostname:
+        if ep.kind == "http" and u.scheme == "https" and u.hostname:
             targets.setdefault((u.hostname, u.port or 443), []).append(ep)
 
     due = []
@@ -871,18 +1131,40 @@ def new_week(now: datetime) -> dict[str, Any]:
 def record_week(st: dict[str, Any], last: ProbeResult, opened: bool,
                 recovered_after_s: float | None, now: datetime) -> None:
     """Add one run's outcome to the endpoint's weekly counters."""
-    w = st.setdefault("week", new_week(now))
     if last.blocked:  # health unknown; leave it out of uptime
         return
-    w["checks"] += 1
-    if last.ok:
-        w["ok"] += 1
-        w["lat_sum"] += last.latency_ms
-        w["lat_n"] += 1
-    if opened:
-        w["incidents"] += 1
-    if recovered_after_s:
-        w["down_s"] += int(recovered_after_s)
+    for bucket, fresh in (("week", new_week), ("month", new_month)):
+        w = st.setdefault(bucket, fresh(now))
+        w["checks"] += 1
+        if last.ok:
+            w["ok"] += 1
+            w["lat_sum"] += last.latency_ms
+            w["lat_n"] += 1
+        if opened:
+            w["incidents"] += 1
+        if recovered_after_s:
+            w["down_s"] += int(recovered_after_s)
+
+
+def new_month(now: datetime) -> dict[str, Any]:
+    return {**new_week(now), "log": []}
+
+
+MONTH_LOG_MAX = 25
+
+
+def month_log_open(st: dict[str, Any], r: ProbeResult, now: datetime) -> None:
+    """Remember each incident for the monthly report: when, and what the check saw."""
+    log = st.setdefault("month", new_month(now)).setdefault("log", [])
+    if len(log) < MONTH_LOG_MAX:
+        log.append({"at": st.get("down_since") or r.checked_at,
+                    "what": r.check_failed or status_text(r)})
+
+
+def month_log_close(st: dict[str, Any], recovered_after_s: float | None) -> None:
+    log = st.get("month", {}).get("log") or []
+    if log and "down_s" not in log[-1]:
+        log[-1]["down_s"] = int(recovered_after_s or 0)
 
 
 def weekly_due(meta: dict[str, Any], now: datetime) -> bool:
@@ -994,6 +1276,260 @@ async def send_weekly(session: aiohttp.ClientSession, endpoints: list[Endpoint],
 
 
 # --------------------------------------------------------------------------- #
+# Branded monthly report (white-label: carries the agency's name, not ours)
+# --------------------------------------------------------------------------- #
+HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def monthly_groups(endpoints: list[Endpoint]) -> dict[str, list[Endpoint]]:
+    """One report per client, keyed by a hash so state never holds client names."""
+    groups: dict[str, list[Endpoint]] = {}
+    for ep in endpoints:
+        if ep.monthly_report:
+            key = hashlib.sha256(ep.client_id.encode()).hexdigest()[:12]
+            groups.setdefault(key, []).append(ep)
+    return groups
+
+
+def report_brand(eps: list[Endpoint]) -> dict[str, Any]:
+    pick = lambda attr: next((getattr(ep, attr) for ep in eps if getattr(ep, attr)), "")  # noqa: E731
+    color = pick("report_color")
+    return {
+        "agency": pick("report_brand"),
+        "client": pick("client_name") or eps[0].client_id,
+        "color": color if HEX_RE.fullmatch(color or "") else "#1f2937",
+        "logo": pick("report_logo_url"),
+        "rph": float(pick("revenue_per_hour") or 0),
+        "tz": pick("timezone"),
+    }
+
+
+def _local(dt: datetime, tz: str) -> datetime:
+    try:
+        return dt.astimezone(ZoneInfo(tz)) if tz else dt
+    except (ZoneInfoNotFoundError, ValueError):
+        return dt
+
+
+def _day(dt: datetime) -> str:
+    return f"{dt:%b} {dt.day}"
+
+
+def month_summary(eps: list[Endpoint], state: dict[str, Any], now: datetime) -> dict[str, Any]:
+    """Numbers for the report and its caption, with open incidents counted up to now."""
+    rows, log = [], []
+    tot = {"checks": 0, "ok": 0, "incidents": 0, "down_s": 0}
+    starts = []
+    for ep in eps:
+        st = state.get(ep.key, {})
+        m = st.get("month") or new_month(now)
+        s0 = parse_ts(m.get("since"))
+        if s0:
+            starts.append(s0)
+        down_s = m["down_s"]
+        ongoing = bool(st.get("incident_open"))
+        if ongoing:
+            since = parse_ts(st.get("down_since"))
+            if since:
+                down_s += int((now - since).total_seconds())
+        for k in ("checks", "ok", "incidents"):
+            tot[k] += m[k]
+        tot["down_s"] += down_s
+        exp = parse_ts(st.get("cert_expires"))
+        rows.append({
+            "name": ep.endpoint_name,
+            "type": "Automation check-in" if ep.kind == "heartbeat" else "API / webhook",
+            "uptime": fmt_pct(m["ok"], m["checks"]),
+            "avg": f"{round(m['lat_sum'] / m['lat_n'])} ms" if m["lat_n"] and ep.kind == "http" else "—",
+            "checks": m["checks"], "incidents": m["incidents"],
+            "down": fmt_duration(timedelta(seconds=down_s)) if down_s else "none",
+            "cert": f"{max(0, (exp - now).days)} days left" if exp else "—",
+            "ongoing": ongoing,
+        })
+        for i, item in enumerate(m.get("log", [])):
+            last = i == len(m["log"]) - 1
+            dur = item.get("down_s")
+            log.append({"at": parse_ts(item.get("at")), "name": ep.endpoint_name,
+                        "what": item.get("what", ""),
+                        "dur": fmt_duration(timedelta(seconds=dur)) if dur
+                        else ("ongoing" if last and ongoing else "under 5 min")})
+    log.sort(key=lambda x: x["at"] or now)
+    start = min(starts, default=now)
+    return {"rows": rows, "log": log, "tot": tot, "start": start}
+
+
+def format_monthly_html(eps: list[Endpoint], state: dict[str, Any], now: datetime) -> str:
+    """A self-contained page the agency can forward or print to PDF for its client."""
+    e = esc
+    b = report_brand(eps)
+    m = month_summary(eps, state, now)
+    tot = m["tot"]
+    agency = b["agency"] or "Cronus Signals"
+    start, end = _local(m["start"], b["tz"]), _local(now, b["tz"])
+    period = f"{_day(start)} – {_day(end)}, {end.year}"
+    n = len(eps)
+    if tot["incidents"] == 0:
+        headline = "Every monitored integration stayed healthy this period."
+    else:
+        k = tot["incidents"]
+        headline = (f"{k} issue{'s were' if k > 1 else ' was'} detected and flagged to "
+                    f"{e(agency)} within minutes of the first failed check.")
+    lede = (f"{n} integration{'s' if n != 1 else ''} behind {e(b['client'])} "
+            f"{'were' if n != 1 else 'was'} checked {tot['checks']:,} times, around the clock.")
+
+    tiles = [("Uptime", fmt_pct(tot["ok"], tot["checks"])), ("Checks run", f"{tot['checks']:,}"),
+             ("Issues detected", str(tot["incidents"])),
+             ("Total downtime", fmt_duration(timedelta(seconds=tot["down_s"])) if tot["down_s"] else "none")]
+    tile_html = "".join(f'<div class="tile"><div class="v">{e(v)}</div><div class="k">{e(k)}</div></div>'
+                        for k, v in tiles)
+    row_html = "".join(
+        f"<tr><td><b>{e(r['name'])}</b><br><span class=muted>{e(r['type'])}</span></td>"
+        f"<td>{e(r['uptime'])}</td><td>{e(r['avg'])}</td><td>{r['incidents']}</td>"
+        f"<td>{e(r['down'])}{' <span class=live>ongoing</span>' if r['ongoing'] else ''}</td>"
+        f"<td>{e(r['cert'])}</td></tr>" for r in m["rows"])
+    if m["log"]:
+        log_html = "<div class=\"scroll\"><table><tr><th>When</th><th>Integration</th><th>What we saw</th><th>Duration</th></tr>" + "".join(
+            f"<tr><td>{e(_day(_local(x['at'], b['tz'])) + ', ' + _local(x['at'], b['tz']).strftime('%H:%M')) if x['at'] else '—'}</td>"
+            f"<td>{e(x['name'])}</td><td>{e(x['what'])}</td><td>{e(x['dur'])}</td></tr>" for x in m["log"]) + "</table></div>"
+    else:
+        log_html = '<p class="muted">No incidents this period.</p>'
+    money = ""
+    if b["rph"] and tot["down_s"]:
+        at_risk = b["rph"] * tot["down_s"] / 3600
+        money = (f'<div class="note"><b>Estimated sales at risk during downtime: ${at_risk:,.0f}</b><br>'
+                 f'<span class="muted">Downtime above × ${b["rph"]:,.0f} per hour (the store\'s average, as '
+                 f'provided). An estimate, not a measured loss.</span></div>')
+    logo = (f'<img src="{e(b["logo"])}" alt="{e(agency)}" class="logo">' if b["logo"]
+            else f'<div class="agency">{e(agency)}</div>')
+    c = b["color"]
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{e(b['client'])} · Stability report · {e(period)}</title>
+<style>
+:root{{--brand:{c};--ink:#111827;--muted:#6b7280;--line:#e5e7eb;--bg:#ffffff;--soft:#f9fafb}}
+*{{box-sizing:border-box}}body{{margin:0;background:var(--soft);color:var(--ink);
+font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}}
+.page{{max-width:820px;margin:24px auto;background:var(--bg);border:1px solid var(--line);border-radius:12px;
+overflow:hidden}}.bar{{height:6px;background:var(--brand)}}.wrap{{padding:32px 36px}}
+header{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}}
+.logo{{max-height:40px;max-width:200px}}.agency{{font-weight:700;font-size:18px;color:var(--brand)}}
+.meta{{text-align:right;color:var(--muted);font-size:13px}}h1{{font-size:26px;margin:28px 0 6px;line-height:1.25}}
+h2{{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:32px 0 10px}}
+.muted{{color:var(--muted);font-size:13px}}.tiles{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:22px}}
+.tile{{border:1px solid var(--line);border-radius:10px;padding:14px}}.tile .v{{font-size:22px;font-weight:700;
+font-variant-numeric:tabular-nums}}.tile .k{{color:var(--muted);font-size:12px}}
+table{{width:100%;border-collapse:collapse;font-size:14px}}th{{text-align:left;font-size:12px;color:var(--muted);
+font-weight:600;border-bottom:1px solid var(--line);padding:8px 6px}}td{{border-bottom:1px solid var(--line);
+padding:10px 6px;vertical-align:top;font-variant-numeric:tabular-nums}}
+.live{{background:#fef2f2;color:#b91c1c;border-radius:6px;padding:1px 6px;font-size:12px}}
+.scroll{{overflow-x:auto;-webkit-overflow-scrolling:touch}}.scroll table{{min-width:560px}}
+.note{{margin-top:20px;border-left:4px solid var(--brand);background:var(--soft);padding:12px 14px;border-radius:6px}}
+footer{{margin-top:32px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:12px}}
+@media (max-width:640px){{.wrap{{padding:22px 16px}}.tiles{{grid-template-columns:repeat(2,1fr)}}
+.meta{{text-align:left}}table{{font-size:13px}}}}
+@media print{{body{{background:#fff}}.page{{margin:0;border:0;border-radius:0}}}}
+</style></head><body><div class="page"><div class="bar"></div><div class="wrap">
+<header>{logo}<div class="meta">Stability report<br><b>{e(b['client'])}</b><br>{e(period)}</div></header>
+<h1>{headline}</h1><p class="muted">{lede}</p>
+<div class="tiles">{tile_html}</div>{money}
+<h2>What we monitor</h2>
+<div class="scroll"><table><tr><th>Integration</th><th>Uptime</th><th>Avg response</th><th>Issues</th><th>Downtime</th><th>Certificate</th></tr>{row_html}</table></div>
+<h2>Incident log</h2>{log_html}
+<footer>Prepared by {e(agency)} for {e(b['client'].rstrip('.'))}. Each integration is checked every 5 minutes; a failed
+check is re-checked 20 seconds later before an alert is raised, so brief blips are not counted as outages.
+Downtime is measured between checks.</footer>
+</div></div></body></html>"""
+
+
+def monthly_caption(eps: list[Endpoint], state: dict[str, Any], now: datetime) -> str:
+    b, m = report_brand(eps), month_summary(eps, state, now)
+    t = m["tot"]
+    down = fmt_duration(timedelta(seconds=t["down_s"])) if t["down_s"] else "no downtime"
+    return (f"📄 <b>MONTHLY REPORT</b> · <b>{esc(b['client'])}</b>\n"
+            f"Uptime {fmt_pct(t['ok'], t['checks'])} · {t['checks']:,} checks · "
+            f"{t['incidents']} issue{'s' if t['incidents'] != 1 else ''} · {down}\n"
+            "The attached page is ready to forward to the client, or print to PDF.")
+
+
+async def send_telegram_document(session: aiohttp.ClientSession, chat_id: str, filename: str,
+                                 data: bytes, caption: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        print("[report] TELEGRAM_BOT_TOKEN not set — report not sent", file=sys.stderr)
+        return False
+    url = TELEGRAM_API.format(token=TELEGRAM_BOT_TOKEN).replace("/sendMessage", "/sendDocument")
+    for attempt in range(3):
+        form = aiohttp.FormData()
+        form.add_field("chat_id", chat_id)
+        form.add_field("caption", caption[:1024])
+        form.add_field("parse_mode", "HTML")
+        form.add_field("document", data, filename=filename, content_type="text/html")
+        try:
+            async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    return True
+                if resp.status == 429:
+                    await asyncio.sleep(3)
+                    continue
+                print(f"[report] Telegram {resp.status}: {(await resp.text())[:200]}", file=sys.stderr)
+                return False
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            await asyncio.sleep(2)
+    return False
+
+
+def report_filename(eps: list[Endpoint], now: datetime) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", (report_brand(eps)["client"]).lower()).strip("-") or "client"
+    return f"{slug}-stability-report-{now:%Y-%m}.html"
+
+
+async def deliver_monthly(session: aiohttp.ClientSession, eps: list[Endpoint],
+                          state: dict[str, Any], now: datetime) -> bool:
+    page = format_monthly_html(eps, state, now).encode("utf-8")
+    name = report_filename(eps, now)
+    caption = monthly_caption(eps, state, now)
+    ep = eps[0]
+    if DRY_RUN:
+        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        (REPORTS_DIR / name).write_bytes(page)
+        print(f"--- DRY RUN → monthly report written to {REPORTS_DIR / name}"
+              if VERBOSE else "--- DRY RUN → monthly report written (set SENTINEL_VERBOSE_LOGS=1 for the path)")
+        return True
+    ok = await send_telegram_document(session, ep.telegram_chat_id, name, page, caption)
+    if ep.slack_webhook_url:  # Slack incoming webhooks can't carry files: send the numbers
+        ok = await send_slack(session, ep.slack_webhook_url,
+                              Alert(ep, "monthly", caption.replace("The attached page",
+                                    "The full page was sent to your Telegram group and"))) and ok
+    return ok
+
+
+async def send_monthly(session: aiohttp.ClientSession, endpoints: list[Endpoint],
+                       state: dict[str, Any], now: datetime, preview: bool) -> None:
+    """On the 1st of the month (from MONTHLY_HOUR_UTC) send each client's branded report and
+    reset its monthly counters once delivered. A preview sends now and keeps the counters."""
+    meta = state.setdefault(META_KEY, {})
+    sent = meta.setdefault("monthly_sent", {})
+    month = now.strftime("%Y-%m")
+    groups = monthly_groups(endpoints)
+    if not preview:
+        if now.day != 1 or now.hour < MONTHLY_HOUR_UTC:
+            return
+        groups = {k: v for k, v in groups.items() if sent.get(k) != month}
+    if not groups:
+        return
+    items = list(groups.items())
+    ok = await asyncio.gather(*(deliver_monthly(session, eps, state, now) for _, eps in items))
+    if not preview:
+        for (key, eps), delivered in zip(items, ok):
+            if delivered:
+                sent[key] = month
+                for ep in eps:
+                    state.setdefault(ep.key, {})["month"] = new_month(now)
+    line = f"{sum(ok)}/{len(ok)} monthly report(s) delivered" + (" (preview)" if preview else "") \
+        + (" (dry run)" if DRY_RUN else "")
+    print(f"::notice title=cronus-monthly::{line}" if IN_ACTIONS else f"[monthly] {line}")
+
+
+# --------------------------------------------------------------------------- #
 # Main run
 # --------------------------------------------------------------------------- #
 async def run() -> int:
@@ -1010,6 +1546,10 @@ async def run() -> int:
     if SEND_WEEKLY:
         async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
             await send_weekly(session, endpoints, state, now, preview=True)
+        return 0
+    if SEND_MONTHLY:
+        async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+            await send_monthly(session, endpoints, state, now, preview=True)
         return 0
 
     idx = {ep.key: i for i, ep in enumerate(endpoints)}
@@ -1043,6 +1583,9 @@ async def run() -> int:
             })
             opened_now, recovered_after = False, None
             for r in results[ep.key]:
+                apply_size_drift(ep, st, r)
+                if r.blocked:  # health unknown (bot challenge, heartbeat not readable): change nothing
+                    continue
                 if r.ok:
                     since, up = parse_ts(st["down_since"]), parse_ts(r.checked_at)
                     if st["incident_open"] and since and up:
@@ -1050,10 +1593,10 @@ async def run() -> int:
                     if st["incident_open"]:
                         alerts.append(Alert(ep, "resolved", format_resolved(ep, r, dict(st))))
                         resolved.append(idx[ep.key])
+                        month_log_close(st, recovered_after)
                     st.update(failure_count=0, incident_open=False, down_since=None,
                               last_alert_at_count=0, last_fail_status=None)
-                    if not r.blocked:  # a challenge page says nothing about health
-                        st["last_ok_at"] = r.checked_at
+                    st["last_ok_at"] = r.checked_at
                     continue
 
                 st["failure_count"] += 1
@@ -1069,6 +1612,7 @@ async def run() -> int:
                     if opening:
                         opened.append(idx[ep.key])
                         opened_now = True
+                        month_log_open(st, r, now)
                     st["incident_open"] = True
                     st["last_alert_at_count"] = n
 
@@ -1107,6 +1651,7 @@ async def run() -> int:
             line = f"{sum(cert_ok)}/{len(cert_ok)} certificate warning(s) delivered"
             print(f"::notice title=cronus-certs::{line}" if IN_ACTIONS else f"[certs] {line}")
         await send_weekly(session, endpoints, state, now, preview=False)
+        await send_monthly(session, endpoints, state, now, preview=False)
 
         # One machine-readable line per run for Jarvis's Ledger (Protocol 8).
         # Counts and endpoint indexes only — the log of a public repo is public;
@@ -1122,8 +1667,9 @@ async def run() -> int:
         if IN_ACTIONS:
             print(f"::notice title=cronus-summary::{line}")
             if blocked:
-                print(f"::warning title=cronus-blocked::{len(blocked)} endpoint(s) answered with a bot-protection "
-                      "challenge, so their health is unknown. Allow the monitor through (see ONBOARDING.md).")
+                print(f"::warning title=cronus-blocked::{len(blocked)} endpoint(s) have unknown health: a "
+                      "bot-protection challenge (allow the monitor through, see ONBOARDING.md), a heartbeat "
+                      "with no check-in yet, or the heartbeat status API is unreachable.")
             if summary["alerts_failed"]:
                 print(f"::warning title=cronus-alert-failed::{summary['alerts_failed']} alert(s) failed to deliver")
         else:
@@ -1133,5 +1679,26 @@ async def run() -> int:
     return 0
 
 
+def new_heartbeat() -> int:
+    """Print a fresh heartbeat id, the URL the client's automation should call, the D1
+    statement that registers it, and the endpoints.json entry to add."""
+    import secrets
+    hb = "hb_" + secrets.token_hex(12)
+    now_ms = int(time.time() * 1000)
+    entry = {"client_id": "<client>", "endpoint_name": "<automation name>", "kind": "heartbeat",
+             "heartbeat_id": hb, "expect_every_min": 60, "telegram_chat_id": "<chat id>"}
+    print(f"Heartbeat id:   {hb}")
+    print(f"Ping URL:       {HEARTBEAT_PING_URL.format(id=hb)}")
+    print("  Add an HTTP/Webhooks step at the END of the Zap or Make scenario that calls this URL")
+    print("  (GET or POST, no body needed), so a check-in means the whole run succeeded.\n")
+    print("Register it (Cloudflare → D1 → cronus-onboarding → Console):")
+    print(f"  insert into heartbeats (id, label, created_at) values ('{hb}', '<client> / <automation>', {now_ms});\n")
+    print("Add to ENDPOINTS_JSON (set expect_every_min to how often it normally runs):")
+    print("  " + json.dumps(entry))
+    return 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["new-heartbeat"]:
+        sys.exit(new_heartbeat())
     sys.exit(asyncio.run(run()))

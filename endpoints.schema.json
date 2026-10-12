@@ -17,7 +17,6 @@
         "required": [
           "client_id",
           "endpoint_name",
-          "target_url",
           "telegram_chat_id"
         ],
         "additionalProperties": false,
@@ -106,7 +105,141 @@
             "type": "boolean",
             "default": true,
             "description": "Include this endpoint in the client's Monday report"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "http",
+              "heartbeat"
+            ],
+            "default": "http",
+            "description": "heartbeat = the client's automation pings us; target_url is filled in automatically"
+          },
+          "heartbeat_id": {
+            "type": "string",
+            "pattern": "^hb_[0-9a-f]{24}$",
+            "description": "From `python sentinel.py new-heartbeat`; registered in the cronus-forms D1 heartbeats table"
+          },
+          "expect_every_min": {
+            "type": "integer",
+            "minimum": 5,
+            "description": "How often the automation normally runs; silence for longer (plus 10% grace) is an incident"
+          },
+          "body_contains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Every phrase must appear in the response (case-insensitive)"
+          },
+          "body_not_contains": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "None of these phrases may appear"
+          },
+          "error_keywords": {
+            "type": "boolean",
+            "default": false,
+            "description": "Also fail on common app-error phrases (fatal error, stack trace, something went wrong, ...)"
+          },
+          "json_rules": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "path"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "description": "e.g. data.items or $.data.items[0].id"
+                },
+                "rule": {
+                  "type": "string",
+                  "enum": [
+                    "exists",
+                    "not_empty",
+                    "equals",
+                    "not_equals",
+                    "min",
+                    "max"
+                  ],
+                  "default": "not_empty"
+                },
+                "value": {
+                  "description": "For equals/not_equals, or a number for min/max (min/max on a list compare its length)"
+                }
+              }
+            }
+          },
+          "min_body_bytes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "A smaller response body is a failure"
+          },
+          "size_drop_pct": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 99,
+            "description": "Fail if the body shrinks this % below its usual size (learned after ~1 hour)"
+          },
+          "monthly_report": {
+            "type": "boolean",
+            "default": true,
+            "description": "Include in the client's branded monthly report"
+          },
+          "client_name": {
+            "type": "string",
+            "description": "Client name shown on the monthly report (default client_id)"
+          },
+          "report_brand": {
+            "type": "string",
+            "description": "The agency's name; the monthly report is white-labelled with it"
+          },
+          "report_color": {
+            "type": "string",
+            "pattern": "^#[0-9a-fA-F]{6}$",
+            "description": "Accent colour for the report"
+          },
+          "report_logo_url": {
+            "type": "string",
+            "pattern": "^https://",
+            "description": "Agency logo shown on the report"
+          },
+          "revenue_per_hour": {
+            "type": "number",
+            "minimum": 0,
+            "description": "Optional; the store's average sales per hour, to estimate sales at risk during downtime"
           }
+        },
+        "if": {
+          "properties": {
+            "kind": {
+              "const": "heartbeat"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        "then": {
+          "required": [
+            "client_id",
+            "endpoint_name",
+            "heartbeat_id",
+            "expect_every_min",
+            "telegram_chat_id"
+          ]
+        },
+        "else": {
+          "required": [
+            "client_id",
+            "endpoint_name",
+            "target_url",
+            "telegram_chat_id"
+          ]
         }
       }
     }

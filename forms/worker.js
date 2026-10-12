@@ -7,6 +7,11 @@
 //                             emailed to the Cronus inbox and a welcome line is posted.
 //   POST /api/stripe/webhook  Stripe events: new paying client, failed payment, cancellation,
 //                             each emailed to the Cronus inbox with what to do next.
+//   GET|POST|HEAD /api/hb/<id>
+//                             A client's Zap / Make scenario / cron job checks in. Only ids
+//                             already registered in the heartbeats table are accepted.
+//   GET  /api/hb/<id>/status  When that heartbeat last checked in (Bearer HEARTBEAT_READ_TOKEN);
+//                             read by sentinel.py every 5 minutes.
 //   daily cron                Emails a reminder about paid clients with no endpoint list after 48h.
 //
 // Setup (Cloudflare → Workers & Pages → cronus-forms):
@@ -18,6 +23,8 @@
 //   Variable SLACK_CLIENT_ID        (plain text)  from the Cronus Slack app → Basic Information
 //   Secret   SLACK_CLIENT_SECRET    (secret)      same page. Also signs the OAuth state.
 //   Secret   STRIPE_WEBHOOK_SECRET  (secret)      whsec_... from Stripe → Developers → Webhooks
+//   Secret   HEARTBEAT_READ_TOKEN   (secret)      any long random string; the same value goes in the
+//                                                 cronus-sentinel GitHub secret of that name
 //
 // Spam handling: a hidden honeypot field, a minimum fill time, length limits and URL checks.
 
@@ -614,12 +621,61 @@ async function dailyCheck(env, now = Date.now()) {
   return { nudged: results.length };
 }
 
+// ---------------------------------------------------------------------------
+// Heartbeats: no-code automations (Zapier, Make, cron) check in; silence is the outage.
+// Ids are registered by the Cronus operator (insert into heartbeats), so random ids cost
+// nothing: an unknown id updates zero rows. Pings closer than HB_MIN_GAP_MS are counted
+// once, which keeps a chatty Zap from using up the D1 free-tier write allowance.
+// ---------------------------------------------------------------------------
+const HB_ID = /^hb_[0-9a-f]{24}$/;
+const HB_MIN_GAP_MS = 30 * 1000;
+
+function safeEqual(a, b) {
+  const x = new TextEncoder().encode(String(a));
+  const y = new TextEncoder().encode(String(b));
+  let diff = x.length ^ y.length;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) diff |= (x[i] ?? 0) ^ (y[i] ?? 0);
+  return diff === 0;
+}
+
+async function handleHeartbeat(request, env, path, now = Date.now()) {
+  const m = path.match(/^\/api\/hb\/([^/]+)(\/status)?$/);
+  if (!m || !HB_ID.test(m[1])) return json({ ok: false, error: 'not found' }, 404);
+  if (!env.DB) return json({ ok: false, error: 'not configured' }, 503);
+  const id = m[1];
+
+  if (m[2]) {  // status, for sentinel.py
+    if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
+    const auth = request.headers.get('authorization') || '';
+    if (!env.HEARTBEAT_READ_TOKEN || !safeEqual(auth, `Bearer ${env.HEARTBEAT_READ_TOKEN}`)) {
+      return json({ ok: false, error: 'unauthorized' }, 401);
+    }
+    const row = await env.DB.prepare('select last_ping, pings from heartbeats where id = ?').bind(id).first();
+    if (!row) return json({ ok: false, error: 'not found' }, 404);
+    return json({ ok: true, last_ping: row.last_ping, pings: row.pings });
+  }
+
+  if (!['GET', 'POST', 'HEAD', 'PUT'].includes(request.method)) {
+    return json({ ok: false, error: 'method not allowed' }, 405);
+  }
+  const r = await env.DB.prepare(
+    `update heartbeats set last_ping = ?, pings = pings + 1
+     where id = ? and (last_ping is null or last_ping < ?)`,
+  ).bind(now, id, now - HB_MIN_GAP_MS).run();
+  if (!r.meta?.changes) {
+    const known = await env.DB.prepare('select 1 from heartbeats where id = ?').bind(id).first();
+    if (!known) return json({ ok: false, error: 'unknown heartbeat' }, 404);
+  }
+  return json({ ok: true });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/api/pilot') return handlePilot(request, env);
     if (url.pathname === '/api/endpoints') return handleEndpoints(request, env);
     if (url.pathname === '/api/stripe/webhook') return handleStripe(request, env);
+    if (url.pathname.startsWith('/api/hb/')) return handleHeartbeat(request, env, url.pathname);
     if (url.pathname === '/api/slack/install' || url.pathname === '/api/slack/callback') {
       if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
       return handleSlack(url, env);
