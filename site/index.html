@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cronus Signals — webhook and API outage alerts for agencies</title>
+<meta name="description" content="Cronus checks your clients' webhook receivers and APIs every 5 minutes, re-checks every failure 20 seconds later, and sends a confirmed incident card to Telegram or Slack. Free 14-day pilot on 3 endpoints.">
+<meta property="og:title" content="Cronus Signals — stop silent webhook outages before your clients notice">
+<meta property="og:description" content="External webhook and API monitoring for web agencies and Shopify developers. Confirmed alerts in Telegram or Slack.">
+<meta property="og:url" content="https://cronussignals.com/">
+<meta name="theme-color" content="#F8FAFC">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 120 120'%3E%3Crect width='120' height='120' rx='26' fill='%230F172A'/%3E%3Cg transform='translate(17 17) scale(0.72)'%3E%3Cpath d='M 105.1 76.4 A 48 48 0 1 1 105.1 43.6' fill='none' stroke='%23F8FAFC' stroke-width='13' stroke-linecap='round'/%3E%3Cpolyline points='30,60 46,60 54,40 66,80 74,60 116,60' fill='none' stroke='%2310B981' stroke-width='13' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!--
+  Styles: Tailwind CSS v3.4 utility classes compiled ahead of time into the
+  <style> block below (no runtime CDN script: no flash of unstyled content, no
+  layout shift). Source: src.html + tailwind.config.js + in.css.
+-->
+<style>*,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.17 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:Geist,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:Geist Mono,ui-monospace,SFMono-Regular,Menlo,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.container{width:100%}@media (min-width:640px){.container{max-width:640px}}@media (min-width:768px){.container{max-width:768px}}@media (min-width:1024px){.container{max-width:1024px}}@media (min-width:1280px){.container{max-width:1280px}}@media (min-width:1536px){.container{max-width:1536px}}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-x-0{left:0;right:0}.inset-x-\[6\%\]{left:6%;right:6%}.bottom-0{bottom:0}.left-0{left:0}.right-0{right:0}.top-0{top:0}.top-9{top:2.25rem}.top-\[22px\]{top:22px}.top-\[30px\]{top:30px}.z-30{z-index:30}.mx-auto{margin-left:auto;margin-right:auto}.mb-1{margin-bottom:.25rem}.ml-3{margin-left:.75rem}.ml-auto{margin-left:auto}.mt-1{margin-top:.25rem}.mt-1\.5{margin-top:.375rem}.mt-10{margin-top:2.5rem}.mt-12{margin-top:3rem}.mt-2{margin-top:.5rem}.mt-3{margin-top:.75rem}.mt-4{margin-top:1rem}.mt-5{margin-top:1.25rem}.mt-6{margin-top:1.5rem}.mt-8{margin-top:2rem}.block{display:block}.flex{display:flex}.inline-flex{display:inline-flex}.grid{display:grid}.hidden{display:none}.h-16{height:4rem}.h-2{height:.5rem}.h-2\.5{height:.625rem}.h-24{height:6rem}.h-3\.5{height:.875rem}.h-5{height:1.25rem}.h-7{height:1.75rem}.h-px{height:1px}.min-h-\[1\.5rem\]{min-height:1.5rem}.min-h-\[44px\]{min-height:44px}.min-h-\[48px\]{min-height:48px}.w-2{width:.5rem}.w-2\.5{width:.625rem}.w-3\.5{width:.875rem}.w-7{width:1.75rem}.w-full{width:100%}.w-px{width:1px}.min-w-0{min-width:0}.min-w-\[17\.5rem\]{min-width:17.5rem}.max-w-2xl{max-width:42rem}.max-w-3xl{max-width:48rem}.max-w-4xl{max-width:56rem}.max-w-6xl{max-width:72rem}.max-w-lg{max-width:32rem}.max-w-xl{max-width:36rem}.flex-1{flex:1 1 0%}.flex-none{flex:none}.-translate-x-0{--tw-translate-x:-0px;transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.scroll-mt-20{scroll-margin-top:5rem}.scroll-mt-24{scroll-margin-top:6rem}.list-disc{list-style-type:disc}.list-none{list-style-type:none}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.grid-cols-\[1fr_1\.2fr_2fr_7rem_2\.75rem\]{grid-template-columns:1fr 1.2fr 2fr 7rem 2.75rem}.grid-cols-\[5\.5rem_1fr_auto\]{grid-template-columns:5.5rem 1fr auto}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.items-baseline{align-items:baseline}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1\.5{gap:.375rem}.gap-10{gap:2.5rem}.gap-12{gap:3rem}.gap-2{gap:.5rem}.gap-2\.5{gap:.625rem}.gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-6{gap:1.5rem}.gap-x-6{-moz-column-gap:1.5rem;column-gap:1.5rem}.gap-y-2{row-gap:.5rem}.space-y-1\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.375rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.375rem*var(--tw-space-y-reverse))}.space-y-10>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(2.5rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(2.5rem*var(--tw-space-y-reverse))}.space-y-2>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.5rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.5rem*var(--tw-space-y-reverse))}.space-y-3>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.75rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.75rem*var(--tw-space-y-reverse))}.space-y-3\.5>:not([hidden])~:not([hidden]){--tw-space-y-reverse:0;margin-top:calc(.875rem*(1 - var(--tw-space-y-reverse)));margin-bottom:calc(.875rem*var(--tw-space-y-reverse))}.divide-y>:not([hidden])~:not([hidden]){--tw-divide-y-reverse:0;border-top-width:calc(1px*(1 - var(--tw-divide-y-reverse)));border-bottom-width:calc(1px*var(--tw-divide-y-reverse))}.divide-slate-100>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(241 245 249/var(--tw-divide-opacity,1))}.divide-slate-200>:not([hidden])~:not([hidden]){--tw-divide-opacity:1;border-color:rgb(226 232 240/var(--tw-divide-opacity,1))}.overflow-hidden{overflow:hidden}.overflow-x-auto{overflow-x:auto}.truncate{overflow:hidden;text-overflow:ellipsis}.truncate,.whitespace-nowrap{white-space:nowrap}.rounded-2xl{border-radius:1rem}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-md{border-radius:.375rem}.rounded-xl{border-radius:.75rem}.border{border-width:1px}.border-2{border-width:2px}.border-y{border-top-width:1px}.border-b,.border-y{border-bottom-width:1px}.border-t{border-top-width:1px}.border-amber-200{--tw-border-opacity:1;border-color:rgb(253 230 138/var(--tw-border-opacity,1))}.border-emerald-200{--tw-border-opacity:1;border-color:rgb(167 243 208/var(--tw-border-opacity,1))}.border-slate-100{--tw-border-opacity:1;border-color:rgb(241 245 249/var(--tw-border-opacity,1))}.border-slate-200{--tw-border-opacity:1;border-color:rgb(226 232 240/var(--tw-border-opacity,1))}.border-slate-200\/80{border-color:rgba(226,232,240,.8)}.border-slate-300{--tw-border-opacity:1;border-color:rgb(203 213 225/var(--tw-border-opacity,1))}.border-white{--tw-border-opacity:1;border-color:rgb(255 255 255/var(--tw-border-opacity,1))}.bg-alert{--tw-bg-opacity:1;background-color:rgb(239 68 68/var(--tw-bg-opacity,1))}.bg-alert\/70{background-color:rgba(239,68,68,.7)}.bg-alert\/80{background-color:rgba(239,68,68,.8)}.bg-alert\/90{background-color:rgba(239,68,68,.9)}.bg-amber-50{--tw-bg-opacity:1;background-color:rgb(255 251 235/var(--tw-bg-opacity,1))}.bg-emerald-50{--tw-bg-opacity:1;background-color:rgb(236 253 245/var(--tw-bg-opacity,1))}.bg-emerald-600{--tw-bg-opacity:1;background-color:rgb(5 150 105/var(--tw-bg-opacity,1))}.bg-ink{background-color:rgb(15 23 42/var(--tw-bg-opacity,1))}.bg-ink,.bg-op{--tw-bg-opacity:1}.bg-op{background-color:rgb(16 185 129/var(--tw-bg-opacity,1))}.bg-paper{--tw-bg-opacity:1;background-color:rgb(248 250 252/var(--tw-bg-opacity,1))}.bg-paper\/85{background-color:rgba(248,250,252,.85)}.bg-red-50\/60{background-color:hsla(0,86%,97%,.6)}.bg-slate-200{--tw-bg-opacity:1;background-color:rgb(226 232 240/var(--tw-bg-opacity,1))}.bg-slate-300{--tw-bg-opacity:1;background-color:rgb(203 213 225/var(--tw-bg-opacity,1))}.bg-slate-50\/70{background-color:rgba(248,250,252,.7)}.bg-warn{--tw-bg-opacity:1;background-color:rgb(245 158 11/var(--tw-bg-opacity,1))}.bg-white{--tw-bg-opacity:1;background-color:rgb(255 255 255/var(--tw-bg-opacity,1))}.p-3{padding:.75rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.p-8{padding:2rem}.px-1{padding-left:.25rem;padding-right:.25rem}.px-2{padding-left:.5rem;padding-right:.5rem}.px-2\.5{padding-left:.625rem;padding-right:.625rem}.px-3{padding-left:.75rem;padding-right:.75rem}.px-3\.5{padding-left:.875rem;padding-right:.875rem}.px-4{padding-left:1rem;padding-right:1rem}.px-5{padding-left:1.25rem;padding-right:1.25rem}.py-0\.5{padding-top:.125rem;padding-bottom:.125rem}.py-1{padding-top:.25rem;padding-bottom:.25rem}.py-1\.5{padding-top:.375rem;padding-bottom:.375rem}.py-10{padding-top:2.5rem;padding-bottom:2.5rem}.py-14{padding-top:3.5rem;padding-bottom:3.5rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-2\.5{padding-top:.625rem;padding-bottom:.625rem}.py-20{padding-top:5rem;padding-bottom:5rem}.py-24{padding-top:6rem;padding-bottom:6rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-3\.5{padding-top:.875rem;padding-bottom:.875rem}.py-4{padding-top:1rem;padding-bottom:1rem}.py-5{padding-top:1.25rem;padding-bottom:1.25rem}.py-6{padding-top:1.5rem;padding-bottom:1.5rem}.py-8{padding-top:2rem;padding-bottom:2rem}.pb-20{padding-bottom:5rem}.pl-5{padding-left:1.25rem}.pr-\[10\%\]{padding-right:10%}.pt-14{padding-top:3.5rem}.pt-3{padding-top:.75rem}.pt-4{padding-top:1rem}.pt-6{padding-top:1.5rem}.text-left{text-align:left}.font-mono{font-family:Geist Mono,ui-monospace,SFMono-Regular,Menlo,monospace}.font-sans{font-family:Geist,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}.text-3xl{font-size:1.875rem;line-height:2.25rem}.text-4xl{font-size:2.25rem;line-height:2.5rem}.text-5xl{font-size:3rem;line-height:1}.text-\[11px\]{font-size:11px}.text-\[12\.5px\]{font-size:12.5px}.text-\[15px\]{font-size:15px}.text-\[2\.6rem\]{font-size:2.6rem}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:.75rem;line-height:1rem}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.tabular-nums{--tw-numeric-spacing:tabular-nums;font-variant-numeric:var(--tw-ordinal) var(--tw-slashed-zero) var(--tw-numeric-figure) var(--tw-numeric-spacing) var(--tw-numeric-fraction)}.leading-6{line-height:1.5rem}.leading-\[1\.05\]{line-height:1.05}.leading-none{line-height:1}.leading-relaxed{line-height:1.625}.tracking-tight{letter-spacing:-.025em}.tracking-wide{letter-spacing:.025em}.tracking-wider{letter-spacing:.05em}.text-alert{--tw-text-opacity:1;color:rgb(239 68 68/var(--tw-text-opacity,1))}.text-amber-700{--tw-text-opacity:1;color:rgb(180 83 9/var(--tw-text-opacity,1))}.text-amber-900{--tw-text-opacity:1;color:rgb(120 53 15/var(--tw-text-opacity,1))}.text-emerald-700{--tw-text-opacity:1;color:rgb(4 120 87/var(--tw-text-opacity,1))}.text-emerald-800{--tw-text-opacity:1;color:rgb(6 95 70/var(--tw-text-opacity,1))}.text-emerald-900{--tw-text-opacity:1;color:rgb(6 78 59/var(--tw-text-opacity,1))}.text-ink{--tw-text-opacity:1;color:rgb(15 23 42/var(--tw-text-opacity,1))}.text-op{--tw-text-opacity:1;color:rgb(16 185 129/var(--tw-text-opacity,1))}.text-slate-400{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}.text-slate-500{--tw-text-opacity:1;color:rgb(100 116 139/var(--tw-text-opacity,1))}.text-slate-600{--tw-text-opacity:1;color:rgb(71 85 105/var(--tw-text-opacity,1))}.text-slate-700{--tw-text-opacity:1;color:rgb(51 65 85/var(--tw-text-opacity,1))}.text-warn{--tw-text-opacity:1;color:rgb(245 158 11/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.underline{text-decoration-line:underline}.decoration-slate-300{text-decoration-color:#cbd5e1}.underline-offset-2{text-underline-offset:2px}.antialiased{-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}.shadow-\[0_12px_40px_-16px_rgba\(15\2c 23\2c 42\2c \.2\)\]{--tw-shadow:0 12px 40px -16px rgba(15,23,42,.2);--tw-shadow-colored:0 12px 40px -16px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-\[0_1px_2px_rgba\(15\2c 23\2c 42\2c \.04\)\2c 0_12px_40px_-12px_rgba\(15\2c 23\2c 42\2c \.18\)\]{--tw-shadow:0 1px 2px rgba(15,23,42,.04),0 12px 40px -12px rgba(15,23,42,.18);--tw-shadow-colored:0 1px 2px var(--tw-shadow-color),0 12px 40px -12px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.shadow-sm{--tw-shadow:0 1px 2px 0 rgba(0,0,0,.05);--tw-shadow-colored:0 1px 2px 0 var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.ring-1{--tw-ring-offset-shadow:var(--tw-ring-inset) 0 0 0 var(--tw-ring-offset-width) var(--tw-ring-offset-color);--tw-ring-shadow:var(--tw-ring-inset) 0 0 0 calc(1px + var(--tw-ring-offset-width)) var(--tw-ring-color);box-shadow:var(--tw-ring-offset-shadow),var(--tw-ring-shadow),var(--tw-shadow,0 0 #0000)}.ring-alert\/40{--tw-ring-color:rgba(239,68,68,.4)}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.backdrop-blur{--tw-backdrop-blur:blur(8px);-webkit-backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia);backdrop-filter:var(--tw-backdrop-blur) var(--tw-backdrop-brightness) var(--tw-backdrop-contrast) var(--tw-backdrop-grayscale) var(--tw-backdrop-hue-rotate) var(--tw-backdrop-invert) var(--tw-backdrop-opacity) var(--tw-backdrop-saturate) var(--tw-backdrop-sepia)}.transition-colors{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke;transition-timing-function:cubic-bezier(.4,0,.2,1)}.duration-150,.transition-colors{transition-duration:.15s}:root{--ease-out:cubic-bezier(0.215,0.61,0.355,1);--focus:#0f172a}h1,h2,h3{text-wrap:balance}[id]{scroll-margin-top:84px}html{scroll-behavior:smooth}a,button,summary{touch-action:manipulation}:focus-visible{outline:2px solid var(--focus);outline-offset:3px;border-radius:6px}.tnum{font-variant-numeric:tabular-nums}.btn{transition:background-color .15s ease,border-color .15s ease,transform .12s var(--ease-out)}.btn:active{transform:scale(.97)}.hit{position:relative}.hit:before{content:"";position:absolute;inset:-10px -6px}#steps .step{transition:opacity .3s var(--ease-out),transform .3s var(--ease-out),background-color .15s ease}#demo.is-armed #steps .step.is-pending{opacity:0;transform:translateY(6px)}#steps .step:not(.is-active):not(.is-done){opacity:.45}#steps .step.is-done{opacity:.8}#steps .step.is-active{opacity:1;background:#f8fafc}#steps .step.is-active .dot{box-shadow:0 0 0 4px rgba(16,185,129,.15)}#steps li:nth-child(2) .step.is-active .dot{box-shadow:0 0 0 4px rgba(239,68,68,.15)}#steps li:nth-child(3) .step.is-active .dot{box-shadow:0 0 0 4px rgba(245,158,11,.18)}#steps .step:focus-visible{outline-offset:-2px}#card{transition:opacity .3s var(--ease-out),transform .3s var(--ease-out),border-color .15s ease}#card:not(.is-sent){opacity:.35;transform:translateY(4px)}#demo.is-armed #card:not(.is-sent){opacity:0;transform:translateY(8px)}#card.is-sent{border-color:rgba(239,68,68,.45)}.faq-icon{transition:transform .2s var(--ease-out)}details[open] .faq-icon{transform:rotate(45deg)}summary::-webkit-details-marker{display:none}.illo{-moz-user-select:none;user-select:none;-webkit-user-select:none}footer{padding-bottom:env(safe-area-inset-bottom)}@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}#card,#steps .step,.btn,.faq-icon{transition:none}.btn:active{transform:none}}.placeholder\:text-slate-400::-moz-placeholder{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}.placeholder\:text-slate-400::placeholder{--tw-text-opacity:1;color:rgb(148 163 184/var(--tw-text-opacity,1))}@media (hover:hover) and (pointer:fine){.hover\:border-ink:hover{--tw-border-opacity:1;border-color:rgb(15 23 42/var(--tw-border-opacity,1))}.hover\:border-slate-300:hover{--tw-border-opacity:1;border-color:rgb(203 213 225/var(--tw-border-opacity,1))}.hover\:border-slate-400:hover{--tw-border-opacity:1;border-color:rgb(148 163 184/var(--tw-border-opacity,1))}.hover\:bg-emerald-700:hover{--tw-bg-opacity:1;background-color:rgb(4 120 87/var(--tw-bg-opacity,1))}.hover\:bg-slate-700:hover{--tw-bg-opacity:1;background-color:rgb(51 65 85/var(--tw-bg-opacity,1))}.hover\:text-ink:hover{--tw-text-opacity:1;color:rgb(15 23 42/var(--tw-text-opacity,1))}.hover\:decoration-ink:hover{text-decoration-color:#0f172a}}.focus\:border-ink:focus{--tw-border-opacity:1;border-color:rgb(15 23 42/var(--tw-border-opacity,1))}.focus-visible\:outline:focus-visible{outline-style:solid}.focus-visible\:outline-2:focus-visible{outline-width:2px}.focus-visible\:outline-offset-2:focus-visible{outline-offset:2px}.focus-visible\:outline-ink:focus-visible{outline-color:#0f172a}.disabled\:opacity-60:disabled{opacity:.6}.has-\[\:checked\]\:border-ink:has(:checked){--tw-border-opacity:1;border-color:rgb(15 23 42/var(--tw-border-opacity,1))}@media (min-width:640px){.sm\:inline{display:inline}.sm\:w-auto{width:auto}.sm\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.sm\:grid-cols-3{grid-template-columns:repeat(3,minmax(0,1fr))}.sm\:flex-row{flex-direction:row}.sm\:flex-wrap{flex-wrap:wrap}.sm\:items-center{align-items:center}.sm\:justify-between{justify-content:space-between}.sm\:p-6{padding:1.5rem}.sm\:p-8{padding:2rem}.sm\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\:text-4xl{font-size:2.25rem;line-height:2.5rem}.sm\:text-6xl{font-size:3.75rem;line-height:1}}@media (min-width:768px){.md\:sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}.md\:col-span-2{grid-column:span 2/span 2}.md\:col-span-4{grid-column:span 4/span 4}.md\:col-span-6{grid-column:span 6/span 6}.md\:row-span-2{grid-row:span 2/span 2}.md\:inline-flex{display:inline-flex}.md\:grid{display:grid}.md\:hidden{display:none}.md\:flex-none{flex:none}.md\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.md\:grid-cols-6{grid-template-columns:repeat(6,minmax(0,1fr))}.md\:grid-cols-\[1fr_1\.2fr\]{grid-template-columns:1fr 1.2fr}.md\:grid-cols-\[1fr_1\.2fr_2fr_7rem_2\.75rem\]{grid-template-columns:1fr 1.2fr 2fr 7rem 2.75rem}.md\:flex-row{flex-direction:row}.md\:items-start{align-items:flex-start}.md\:items-center{align-items:center}.md\:justify-between{justify-content:space-between}.md\:gap-3{gap:.75rem}.md\:gap-8{gap:2rem}.md\:border-0{border-width:0}.md\:p-0{padding:0}.md\:pt-2{padding-top:.5rem}}@media (min-width:1024px){.lg\:inline{display:inline}.lg\:grid-cols-\[1\.05fr_1fr\]{grid-template-columns:1.05fr 1fr}.lg\:grid-cols-\[1fr_1\.15fr\]{grid-template-columns:1fr 1.15fr}.lg\:grid-cols-\[1fr_26rem\]{grid-template-columns:1fr 26rem}.lg\:items-start{align-items:flex-start}.lg\:items-center{align-items:center}.lg\:gap-16{gap:4rem}.lg\:pt-20{padding-top:5rem}}</style>
+</head>
+<body class="bg-paper text-ink font-sans antialiased">
+
+<!-- ============================== HEADER ============================== -->
+<header class="sticky top-0 z-30 border-b border-slate-200/80 bg-paper/85 backdrop-blur">
+  <div class="mx-auto flex h-16 max-w-6xl items-center gap-6 px-4 sm:px-6">
+    <a href="#top" class="flex min-h-[44px] items-center gap-2.5 font-semibold tracking-tight" aria-label="Cronus Signals, back to top">
+      <svg width="26" height="26" viewBox="0 0 120 120" aria-hidden="true"><path d="M 105.1 76.4 A 48 48 0 1 1 105.1 43.6" fill="none" stroke="#0F172A" stroke-width="11" stroke-linecap="round"/><polyline points="30,60 46,60 54,40 66,80 74,60 116,60" fill="none" stroke="#10B981" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Cronus Signals
+    </a>
+
+    <!-- Live engine status: read from the cloud monitor's GitHub Actions runs. Display only, no link. -->
+    <div id="engine" role="status" aria-live="polite"
+       class="tnum hidden md:inline-flex min-w-[17.5rem] items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-600">
+      <span id="engine-dot" class="h-2 w-2 rounded-full bg-slate-300" aria-hidden="true"></span>
+      <span id="engine-text">Cronus engine: checking…</span>
+    </div>
+
+    <nav class="ml-auto flex items-center gap-6 text-sm" aria-label="Main">
+      <a href="#demo" class="hidden py-3 text-slate-600 hover:text-ink lg:inline">How it works</a>
+      <a href="#features" class="hidden py-3 text-slate-600 hover:text-ink lg:inline">Specs</a>
+      <a href="#pricing" class="hidden py-3 text-slate-600 hover:text-ink lg:inline">Pricing</a>
+      <a href="#faq" class="hidden py-3 text-slate-600 hover:text-ink lg:inline">FAQ</a>
+      <a href="#pilot" data-pilot class="btn inline-flex min-h-[44px] items-center rounded-lg bg-ink px-3.5 font-medium text-white hover:bg-slate-700">Request free pilot</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ============================== HERO ============================== -->
+<section class="mx-auto grid max-w-6xl items-center gap-12 px-4 pb-20 pt-14 sm:px-6 lg:grid-cols-[1.05fr_1fr] lg:gap-16 lg:pt-20">
+  <div class="min-w-0">
+    <p class="inline-flex items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-medium tracking-wide text-emerald-800">⚡ ZERO-SETUP WEBHOOK SENTINEL FOR AGENCIES</p>
+    <h1 class="mt-6 text-[2.6rem] font-bold leading-[1.05] tracking-tight sm:text-6xl">Know a client’s webhook is down before the client does.</h1>
+    <p class="mt-6 max-w-xl text-lg leading-relaxed text-slate-600">
+      Cronus checks the Shopify webhooks, form handlers and APIs your agency looks after every 5 minutes. When one fails, it checks again 20 seconds later. If it fails twice, an incident card goes to your Telegram or Slack channel with the status code and what to look at first.
+    </p>
+    <div class="mt-8 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
+      <a href="#pilot" data-pilot class="btn inline-flex items-center justify-center whitespace-nowrap rounded-xl bg-emerald-600 px-5 py-3.5 font-semibold text-white shadow-sm hover:bg-emerald-700">Start 14-day free pilot (3 endpoints)</a>
+      <a href="#demo" class="btn inline-flex items-center justify-center whitespace-nowrap rounded-xl border border-slate-300 bg-white px-5 py-3.5 font-semibold text-ink hover:border-slate-400">See how an alert happens</a>
+    </div>
+    <p class="mt-4 text-sm text-slate-500">No card. No code to install. You send the URLs, we set it up.</p>
+  </div>
+
+  <!-- Hero visual: the real four-step alert sequence. Steps advance on their own; any step can be clicked. -->
+  <div id="demo" class="min-w-0 scroll-mt-24 rounded-2xl border border-slate-200 bg-white shadow-[0_1px_2px_rgba(15,23,42,.04),0_12px_40px_-12px_rgba(15,23,42,.18)]">
+    <div class="flex items-center justify-between border-b border-slate-200 px-5 py-3.5">
+      <div class="min-w-0">
+        <p class="text-sm font-semibold">orders-webhook · ridgeline</p>
+        <p class="truncate font-mono text-xs text-slate-500">POST https://api.ridgeline.co/hooks/orders</p>
+      </div>
+      <button id="replay" type="button" class="btn hit ml-3 flex-none whitespace-nowrap rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-600 hover:border-slate-300 hover:text-ink" aria-controls="steps">Play sequence</button>
+    </div>
+
+    <ol class="divide-y divide-slate-100" id="steps">
+      <li><button type="button" data-step="0" class="step flex w-full items-start gap-4 px-5 py-4 text-left">
+        <span class="dot mt-1 h-2.5 w-2.5 flex-none rounded-full bg-op"></span>
+        <span class="flex-1"><span class="block text-sm font-medium">Healthy</span>
+          <span class="tnum block font-mono text-xs text-slate-500">03:05:00 &nbsp;200 OK &nbsp;181 ms</span></span>
+        <span class="font-mono text-xs text-slate-400">1</span></button></li>
+      <li><button type="button" data-step="1" class="step flex w-full items-start gap-4 px-5 py-4 text-left">
+        <span class="dot mt-1 h-2.5 w-2.5 flex-none rounded-full bg-alert"></span>
+        <span class="flex-1"><span class="block text-sm font-medium">Failure detected</span>
+          <span class="tnum block font-mono text-xs text-slate-500">03:10:00 &nbsp;500 Internal Server Error &nbsp;1,302 ms</span></span>
+        <span class="font-mono text-xs text-slate-400">2</span></button></li>
+      <li><button type="button" data-step="2" class="step flex w-full items-start gap-4 px-5 py-4 text-left">
+        <span class="dot mt-1 h-2.5 w-2.5 flex-none rounded-full bg-warn"></span>
+        <span class="flex-1"><span class="block text-sm font-medium">Re-checked 20 seconds later</span>
+          <span class="tnum block font-mono text-xs text-slate-500">03:10:20 &nbsp;500 again &nbsp;→ confirmed, 2 in a row</span></span>
+        <span class="font-mono text-xs text-slate-400">3</span></button></li>
+      <li><button type="button" data-step="3" class="step flex w-full items-start gap-4 px-5 py-4 text-left">
+        <span class="dot mt-1 h-2.5 w-2.5 flex-none rounded-full bg-ink"></span>
+        <span class="flex-1"><span class="block text-sm font-medium">Incident card sent to Telegram</span>
+          <span class="tnum block font-mono text-xs text-slate-500">03:10:21 &nbsp;#ridgeline-alerts</span></span>
+        <span class="font-mono text-xs text-slate-400">4</span></button></li>
+    </ol>
+
+    <!-- The message the agency actually receives (step 4). -->
+    <div class="border-t border-slate-200 bg-slate-50/70 p-5">
+      <div id="card" class="rounded-xl border border-slate-200 bg-white p-4">
+        <div class="flex items-center justify-between">
+          <p class="font-mono text-xs font-medium text-alert">🔴 CRONUS SIGNAL · INCIDENT</p>
+          <p class="font-mono text-[11px] text-slate-400">Telegram</p>
+        </div>
+        <pre class="tnum mt-3 overflow-x-auto font-mono text-[12.5px] leading-6 text-slate-700"><span class="text-slate-400">STATUS  </span> 500 Internal Server Error
+<span class="text-slate-400">LATENCY </span> 1,284 ms (budget 3,000 ms)
+<span class="text-slate-400">FAILURES</span> 2 consecutive
+<span class="text-slate-400">TIME    </span> 03:10:20 UTC</pre>
+        <p class="mt-3 border-t border-slate-100 pt-3 text-sm text-slate-700"><span class="font-semibold text-amber-700">First check:</span> pull the app logs for 03:10 UTC and review the last deploy.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PLATFORM STRIP ============================== -->
+<section class="border-y border-slate-200 bg-white">
+  <div class="mx-auto flex max-w-6xl flex-col gap-4 px-4 py-6 sm:px-6 md:flex-row md:items-start md:gap-8">
+    <p class="text-sm text-slate-500 md:flex-none md:pt-2">Works with any HTTP endpoint, including:</p>
+    <ul class="flex flex-wrap gap-2.5 text-sm font-medium text-slate-700">
+      <li class="rounded-lg border border-slate-200 bg-paper px-3 py-1.5">Shopify &amp; Shopify Plus webhooks</li>
+      <li class="rounded-lg border border-slate-200 bg-paper px-3 py-1.5">Webflow form &amp; site webhooks</li>
+      <li class="rounded-lg border border-slate-200 bg-paper px-3 py-1.5">Custom Node.js &amp; Python APIs</li>
+      <li class="rounded-lg border border-slate-200 bg-paper px-3 py-1.5">Zapier / Make webhook endpoints</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ============================== PAIN POINT ============================== -->
+<section class="mx-auto max-w-6xl px-4 py-24 sm:px-6">
+  <div class="grid gap-12 lg:grid-cols-[1fr_1.15fr] lg:items-center">
+    <div>
+      <h2 class="text-3xl font-bold tracking-tight sm:text-4xl">Four hours of retries, then the orders stop arriving.</h2>
+      <p class="mt-5 text-lg leading-relaxed text-slate-600">
+        When a store’s webhook receiver starts returning errors, Shopify retries the delivery up to 8 times over 4 hours. If it is still failing, Shopify removes the webhook subscription. New orders stop reaching the ERP or warehouse system, and the storefront looks completely normal the whole time.
+      </p>
+      <p class="mt-4 text-lg leading-relaxed text-slate-600">
+        Cronus raises the alarm within minutes of the first confirmed failure, while the retries are still running and the subscription can still be saved.
+      </p>
+      <p class="mt-6 text-sm text-slate-500">Source: <a class="underline decoration-slate-300 underline-offset-2 hover:text-ink" href="https://shopify.dev/docs/apps/build/webhooks/troubleshooting" target="_blank" rel="noopener">Shopify developer docs, “Troubleshoot webhooks”</a>.</p>
+    </div>
+
+    <!-- Retry timeline: 8 retries across 4 hours, then removal. Cronus's alert sits at the start. -->
+    <figure class="rounded-2xl border border-slate-200 bg-white p-6">
+      <figcaption class="flex items-center justify-between text-sm">
+        <span class="font-medium">One failing webhook, as Shopify handles it</span>
+        <span class="font-mono text-xs text-slate-500">0h → 4h</span>
+      </figcaption>
+      <div class="illo relative mt-8 h-24" role="img" aria-label="Timeline: Cronus alerts at the first confirmed failure; Shopify then retries the webhook 8 times over 4 hours and removes the subscription.">
+        <div class="absolute left-0 right-0 top-9 h-px bg-slate-200"></div>
+        <!-- Cronus alert marker -->
+        <div class="absolute left-0 top-0 flex -translate-x-0 flex-col items-start">
+          <span class="rounded-md bg-emerald-600 px-2 py-0.5 font-mono text-[11px] font-medium text-white">Cronus alert</span>
+          <span class="ml-3 h-5 w-px bg-emerald-600"></span>
+        </div>
+        <!-- 8 retries -->
+        <div class="absolute inset-x-[6%] top-[30px] flex justify-between pr-[10%]">
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/70 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/70 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/70 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/70 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/80 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/80 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert/90 ring-1 ring-alert/40"></span>
+          <span class="h-3.5 w-3.5 rounded-full border-2 border-white bg-alert ring-1 ring-alert/40"></span>
+        </div>
+        <!-- removal marker -->
+        <div class="absolute right-0 top-[22px] flex flex-col items-end">
+          <span class="flex h-7 w-7 items-center justify-center rounded-full bg-ink font-mono text-sm text-white">✕</span>
+        </div>
+        <div class="absolute inset-x-0 bottom-0 flex justify-between font-mono text-[11px] text-slate-500">
+          <span>first failure</span><span class="hidden sm:inline">8 retries</span><span>subscription removed</span>
+        </div>
+      </div>
+      <p class="mt-6 border-t border-slate-100 pt-4 text-sm text-slate-600">Retries are spread over the four hours; the dots show the count, not exact timings.</p>
+    </figure>
+  </div>
+</section>
+
+<!-- ============================== SPECS (BENTO) ============================== -->
+<section id="features" class="scroll-mt-20 border-t border-slate-200 bg-white">
+  <div class="mx-auto max-w-6xl px-4 py-24 sm:px-6">
+    <h2 class="max-w-2xl text-3xl font-bold tracking-tight sm:text-4xl">What Cronus does, exactly</h2>
+    <p class="mt-4 max-w-2xl text-lg text-slate-600">Four mechanics, no black box. These are the same rules the engine runs on.</p>
+
+    <div class="mt-12 grid gap-4 md:grid-cols-6">
+      <!-- Two-failure verification: the defining rule, given the big cell -->
+      <article class="rounded-xl border border-slate-200 bg-paper p-6 md:col-span-4 md:row-span-2">
+        <h3 class="text-lg font-semibold">Two-failure verification</h3>
+        <p class="mt-2 max-w-lg text-slate-600">A failed check is repeated 20 seconds later. Only a second failure opens an incident, so a single dropped packet or a slow deploy restart doesn’t page anyone. While an incident stays open, duplicate alerts are held back.</p>
+        <div class="illo tnum mt-6 overflow-hidden rounded-lg border border-slate-200 bg-white font-mono text-[12.5px]">
+          <div class="grid grid-cols-[5.5rem_1fr_auto] gap-3 border-b border-slate-100 px-4 py-2.5"><span class="text-slate-400">03:10:00</span><span>POST /hooks/orders</span><span class="text-alert">500 · 1 of 2</span></div>
+          <div class="grid grid-cols-[5.5rem_1fr_auto] gap-3 border-b border-slate-100 px-4 py-2.5"><span class="text-slate-400">03:10:20</span><span>re-check</span><span class="text-alert">500 · 2 of 2</span></div>
+          <div class="grid grid-cols-[5.5rem_1fr_auto] gap-3 border-b border-slate-100 bg-red-50/60 px-4 py-2.5"><span class="text-slate-400">03:10:21</span><span>incident opened</span><span class="font-medium text-alert">alert sent</span></div>
+          <div class="grid grid-cols-[5.5rem_1fr_auto] gap-3 px-4 py-2.5"><span class="text-slate-400">03:31:00</span><span>POST /hooks/orders</span><span class="text-emerald-700">200 · resolved</span></div>
+        </div>
+      </article>
+
+      <article class="rounded-xl border border-slate-200 bg-paper p-6 md:col-span-2">
+        <h3 class="text-lg font-semibold">5-minute health sweeps</h3>
+        <p class="mt-2 text-slate-600">Every endpoint is checked in parallel every 5 minutes, from outside your stack. No database access, no agent.</p>
+        <p class="mt-4 font-mono text-xs text-slate-500">interval: 300s · timeout: 3s default</p>
+      </article>
+
+      <article class="rounded-xl border border-slate-200 bg-paper p-6 md:col-span-2">
+        <h3 class="text-lg font-semibold">Exact status codes</h3>
+        <p class="mt-2 text-slate-600">Each alert carries the real HTTP response and a first check to match it.</p>
+        <ul class="mt-4 grid grid-cols-2 gap-2 font-mono text-xs">
+          <li class="rounded-md border border-slate-200 bg-white px-2 py-1.5"><span class="text-alert">500</span> app error</li>
+          <li class="rounded-md border border-slate-200 bg-white px-2 py-1.5"><span class="text-alert">502</span> proxy</li>
+          <li class="rounded-md border border-slate-200 bg-white px-2 py-1.5"><span class="text-alert">504</span> too slow</li>
+          <li class="rounded-md border border-slate-200 bg-white px-2 py-1.5"><span class="text-warn">404</span> route gone</li>
+        </ul>
+      </article>
+
+      <article class="rounded-xl border border-slate-200 bg-paper p-6 md:col-span-6">
+        <div class="grid gap-6 md:grid-cols-[1fr_1.2fr] md:items-center">
+          <div>
+            <h3 class="text-lg font-semibold">No dashboard to watch</h3>
+            <p class="mt-2 text-slate-600">Incident and recovery cards go straight into the Telegram or Slack channel your developers already have open, one channel per client so nobody has to work out whose site it is.</p>
+          </div>
+          <div class="flex flex-col gap-2 font-mono text-[12.5px]">
+            <div class="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5"><span><span class="text-alert">●</span> INCIDENT · orders-webhook</span><span class="text-slate-400">#ridgeline-alerts</span></div>
+            <div class="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5"><span><span class="text-op">●</span> RESOLVED · down 21 min</span><span class="text-slate-400">#ridgeline-alerts</span></div>
+          </div>
+        </div>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PRICING ============================== -->
+<section id="pricing" class="scroll-mt-20 border-t border-slate-200">
+  <div class="mx-auto grid max-w-6xl gap-12 px-4 py-24 sm:px-6 lg:grid-cols-[1fr_26rem] lg:items-start">
+    <div>
+      <h2 class="text-3xl font-bold tracking-tight sm:text-4xl">One plan, priced per agency</h2>
+      <p class="mt-4 max-w-xl text-lg leading-relaxed text-slate-600">Start with three endpoints for 14 days. If Cronus catches something you’d have missed, move up to 25 endpoints. No seats, no per-client fees.</p>
+      <dl class="mt-10 grid max-w-xl gap-6 sm:grid-cols-2">
+        <div><dt class="font-mono text-xs text-slate-500">pilot</dt><dd class="mt-1 font-medium">3 endpoints, 14 days, free</dd></div>
+        <div><dt class="font-mono text-xs text-slate-500">card</dt><dd class="mt-1 font-medium">Not asked for during the pilot</dd></div>
+        <div><dt class="font-mono text-xs text-slate-500">setup</dt><dd class="mt-1 font-medium">Done by us, test alert included</dd></div>
+        <div><dt class="font-mono text-xs text-slate-500">cancel</dt><dd class="mt-1 font-medium">Any time</dd></div>
+      </dl>
+    </div>
+
+    <div class="rounded-2xl border border-slate-200 bg-white p-8 shadow-[0_12px_40px_-16px_rgba(15,23,42,.2)]">
+      <p class="font-semibold">Pro Agency</p>
+      <p class="mt-4 flex items-baseline gap-2"><span class="text-5xl font-bold tracking-tight">$99</span><span class="text-slate-500">/ month</span></p>
+      <ul class="mt-8 space-y-3.5 text-[15px]">
+        <li class="flex gap-3"><svg class="mt-1 flex-none" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="#059669" stroke-width="2" fill="none" stroke-linecap="round"/></svg>Up to 25 webhooks and API endpoints</li>
+        <li class="flex gap-3"><svg class="mt-1 flex-none" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="#059669" stroke-width="2" fill="none" stroke-linecap="round"/></svg>Health checks every 5 minutes</li>
+        <li class="flex gap-3"><svg class="mt-1 flex-none" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="#059669" stroke-width="2" fill="none" stroke-linecap="round"/></svg>20-second re-check before any alert</li>
+        <li class="flex gap-3"><svg class="mt-1 flex-none" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="#059669" stroke-width="2" fill="none" stroke-linecap="round"/></svg>Telegram and Slack incident routing</li>
+        <li class="flex gap-3"><svg class="mt-1 flex-none" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" stroke="#059669" stroke-width="2" fill="none" stroke-linecap="round"/></svg>Includes a 14-day free pilot on 3 endpoints</li>
+      </ul>
+      <a href="#pilot" data-pilot class="btn mt-8 flex w-full items-center justify-center rounded-xl bg-ink px-5 py-3.5 font-semibold text-white hover:bg-slate-700">Get 3 free pilot endpoints</a>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== FAQ ============================== -->
+<section id="faq" class="scroll-mt-20 border-t border-slate-200 bg-white">
+  <div class="mx-auto max-w-3xl px-4 py-24 sm:px-6">
+    <h2 class="text-3xl font-bold tracking-tight sm:text-4xl">Questions agencies ask</h2>
+    <div class="mt-10 divide-y divide-slate-200 border-y border-slate-200">
+      <details class="group py-5">
+        <summary class="flex min-h-[44px] cursor-pointer list-none items-center justify-between gap-6 font-medium">Does Cronus need access to our codebase or servers?
+          <span class="faq-icon font-mono text-lg leading-none text-slate-400" aria-hidden="true">+</span></summary>
+        <p class="mt-3 text-slate-600">No. Cronus sends ordinary HTTP requests to the URLs you give it, from outside your infrastructure, the same way a customer or Shopify would. There’s nothing to install and no credentials to share.</p>
+      </details>
+      <details class="group py-5">
+        <summary class="flex min-h-[44px] cursor-pointer list-none items-center justify-between gap-6 font-medium">How does the 20-second re-check prevent false alarms?
+          <span class="faq-icon font-mono text-lg leading-none text-slate-400" aria-hidden="true">+</span></summary>
+        <p class="mt-3 text-slate-600">Most one-off failures are a blip: a dropped connection, a container restarting during a deploy. When a check fails, Cronus waits 20 seconds and checks again. Only if the second check also fails does it open an incident and send the alert. That cuts out most false alarms; it can’t promise none, because an endpoint that is down for exactly those 20 seconds will still be reported.</p>
+      </details>
+      <details class="group py-5">
+        <summary class="flex min-h-[44px] cursor-pointer list-none items-center justify-between gap-6 font-medium">What happens after the 14-day free pilot?
+          <span class="faq-icon font-mono text-lg leading-none text-slate-400" aria-hidden="true">+</span></summary>
+        <p class="mt-3 text-slate-600">We send you a summary of everything the pilot checked and caught. If you want to keep it, you move to Pro Agency at $99 a month. If not, we switch the monitors off. No card is taken during the pilot, so there’s nothing to cancel and no surprise charge.</p>
+      </details>
+      <details class="group py-5">
+        <summary class="flex min-h-[44px] cursor-pointer list-none items-center justify-between gap-6 font-medium">How long does setup take?
+          <span class="faq-icon font-mono text-lg leading-none text-slate-400" aria-hidden="true">+</span></summary>
+        <p class="mt-3 text-slate-600">Your part takes about a minute: email us the URLs and the Telegram group or Slack channel for alerts. We configure the monitors and send a test alert so you can see one arrive before anything real happens.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== FINAL CTA ============================== -->
+<section id="pilot" class="scroll-mt-20 border-t border-slate-200">
+  <div class="mx-auto grid max-w-6xl gap-10 px-4 py-20 sm:px-6 md:grid-cols-2 md:items-start">
+    <div class="min-w-0">
+      <h2 class="max-w-xl text-3xl font-bold tracking-tight">Send us three endpoints you’d hate to see fail.</h2>
+      <p class="mt-3 max-w-xl text-slate-600">Fill this in and we’ll set up the monitors, then send a test alert so you can see one arrive before anything real happens. Free for 14 days, no card.</p>
+      <ul class="mt-6 space-y-2 text-sm text-slate-600">
+        <li>Webhook receivers, form handlers, API health URLs: anything with a public URL.</li>
+        <li>Alerts go to a Telegram group or a Slack channel. Slack connects in two clicks after you send this.</li>
+        <li>Prefer email? <a class="underline decoration-slate-300 underline-offset-2 hover:text-ink" href="mailto:hello@cronussignals.com">hello@cronussignals.com</a></li>
+      </ul>
+    </div>
+    <form id="pilot-form" class="min-w-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-6" novalidate>
+      <div class="grid gap-4 sm:grid-cols-2">
+        <label class="block text-sm font-medium">Your name<input name="name" required autocomplete="name" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink"></label>
+        <label class="block text-sm font-medium">Work email<input name="email" type="email" required autocomplete="email" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink"></label>
+      </div>
+      <label class="mt-4 block text-sm font-medium">Agency or company<input name="agency" required autocomplete="organization" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink"></label>
+      <fieldset class="mt-4">
+        <legend class="text-sm font-medium">Endpoints to watch</legend>
+        <input name="url1" type="url" required placeholder="https://… (required)" aria-label="Endpoint 1 URL" inputmode="url" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink">
+        <input name="url2" type="url" placeholder="https://… (optional)" aria-label="Endpoint 2 URL" inputmode="url" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink">
+        <input name="url3" type="url" placeholder="https://… (optional)" aria-label="Endpoint 3 URL" inputmode="url" class="mt-1.5 block min-h-[44px] w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink placeholder:text-slate-400 focus:border-ink">
+      </fieldset>
+      <fieldset class="mt-4">
+        <legend class="text-sm font-medium">Send alerts to</legend>
+        <div class="mt-1.5 flex gap-3">
+          <label class="flex min-h-[44px] flex-1 cursor-pointer items-center gap-2 rounded-lg border border-slate-300 px-3 text-sm has-[:checked]:border-ink"><input type="radio" name="channel" value="telegram" checked> Telegram</label>
+          <label class="flex min-h-[44px] flex-1 cursor-pointer items-center gap-2 rounded-lg border border-slate-300 px-3 text-sm has-[:checked]:border-ink"><input type="radio" name="channel" value="slack"> Slack</label>
+        </div>
+      </fieldset>
+      <label class="mt-4 block text-sm font-medium">Anything we should know? <span class="font-normal text-slate-500">(optional)</span><textarea name="notes" rows="2" class="mt-1.5 block w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-base text-ink focus:border-ink"></textarea></label>
+      <div class="hidden" aria-hidden="true"><label>Leave empty<input name="website" tabindex="-1" autocomplete="off"></label></div>
+      <button type="submit" class="btn mt-5 flex min-h-[48px] w-full items-center justify-center rounded-xl bg-emerald-600 px-5 font-semibold text-white shadow-sm hover:bg-emerald-700 disabled:opacity-60">Start 14-day free pilot</button>
+      <p id="pilot-status" class="mt-3 min-h-[1.5rem] text-sm text-slate-600" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</section>
+</main>
+
+<!-- ============================== FOOTER ============================== -->
+<footer class="border-t border-slate-200 bg-white">
+  <div class="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-10 text-sm text-slate-500 sm:px-6 md:flex-row md:items-center md:justify-between">
+    <div>
+      <p class="font-medium text-ink">Cronus Signals</p>
+      <p class="mt-1">Built by developers for web development agencies. © <span id="year">2026</span></p>
+    </div>
+    <nav class="flex flex-wrap gap-x-6 gap-y-2" aria-label="Footer">
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="#demo">How it works</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="#features">Specs</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="#pricing">Pricing</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="#faq">FAQ</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="/pilot-terms">Pilot terms</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="/privacy">Privacy</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="/refunds">Refunds</a>
+      <a class="inline-flex min-h-[44px] items-center hover:text-ink" href="mailto:hello@cronussignals.com">hello@cronussignals.com</a>
+    </nav>
+  </div>
+</footer>
+
+<script>
+(() => {
+  /* ---- Pilot form: posts to /api/pilot (Cloudflare Worker emails it to hello@) ---- */
+  const form = document.getElementById('pilot-form');
+  const status = document.getElementById('pilot-status');
+  const started = Date.now();
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!form.checkValidity()) { form.reportValidity(); return; }
+    const btn = form.querySelector('button[type=submit]');
+    const data = Object.fromEntries(new FormData(form));
+    data.elapsed = Date.now() - started;
+    btn.disabled = true; status.textContent = 'Sending…';
+    try {
+      const res = await fetch('/api/pilot', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) });
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok || !out.ok) throw new Error(out.error || 'send failed');
+      form.reset();
+      status.textContent = 'Got it. We’ll reply from hello@cronussignals.com with the next step.';
+      if (data.channel === 'slack') {
+        const link = document.createElement('a');
+        link.href = '/connect'; link.className = 'font-medium text-ink underline underline-offset-2';
+        link.textContent = 'Connect your Slack channel now';
+        status.append(' ', link, ' (two clicks).');
+      }
+    } catch (err) {
+      status.innerHTML = 'That didn’t send. Please email <a class="underline" href="mailto:hello@cronussignals.com">hello@cronussignals.com</a> instead.';
+    } finally { btn.disabled = false; }
+  });
+  document.getElementById('year').textContent = new Date().getFullYear();
+
+  /* ---- Live engine status from the public GitHub Actions runs ----
+     Green: a run (scheduled or triggered by the 5-minute ticker) finished successfully in the last 20 minutes.
+     Amber: the last run is older than that, or it failed.
+     If GitHub can't be reached the pill is hidden rather than showing a guess.
+     The latest run is cached for 2 minutes per tab to stay under GitHub's
+     60-requests-per-hour limit for unauthenticated visitors. */
+  const engine = document.getElementById('engine');
+  const dot = document.getElementById('engine-dot');
+  const label = document.getElementById('engine-text');
+  const ago = ms => { const m = Math.round(ms / 60000); return m < 1 ? 'just now' : m < 60 ? m + ' min ago' : Math.round(m / 60) + ' h ago'; };
+  const render = run => {
+    if (!run) { engine.style.display = 'none'; return; }
+    const age = Date.now() - Date.parse(run.updated_at);
+    const ok = run.conclusion === 'success' && age < 20 * 60000;
+    dot.className = 'h-2 w-2 rounded-full ' + (ok ? 'bg-op' : 'bg-warn');
+    label.textContent = (ok ? 'Cronus engine: running · last check ' : 'Cronus engine: last check ') + ago(age);
+  };
+  let cached = null;
+  try { const c = JSON.parse(sessionStorage.getItem('cronus-engine') || 'null'); if (c && Date.now() - c.at < 120000) cached = c.run; } catch (e) {}
+  if (cached) render(cached);
+  else fetch('https://api.github.com/repos/johnathangonzo88-droid/cronus-sentinel/actions/workflows/sentinel.yml/runs?per_page=10', { headers: { Accept: 'application/vnd.github+json' } })
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(d => {
+      const found = (d.workflow_runs || []).find(r => r.status === 'completed');
+      const run = found ? { updated_at: found.updated_at, conclusion: found.conclusion } : null;
+      if (run) { try { sessionStorage.setItem('cronus-engine', JSON.stringify({ at: Date.now(), run })); } catch (e) {} }
+      render(run);
+    })
+    .catch(() => render(null));
+
+  /* ---- Alert sequence demo ----
+     Plays when the demo scrolls into view: each step appears in turn,
+     then the incident card lands. Pauses if it leaves the viewport or the
+     tab is hidden, resumes on return. "Play sequence" replays it; any step
+     can be clicked to inspect it. Reduced motion: final state, no animation. */
+  const demo = document.getElementById('demo');
+  const steps = [...document.querySelectorAll('#steps .step')];
+  const card = document.getElementById('card');
+  const playBtn = document.getElementById('replay');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const STEP_MS = 900;
+  let timer = null, n = -1, inView = false;
+  const show = k => {
+    n = k;
+    steps.forEach((s, i) => {
+      s.classList.toggle('is-active', i === k);
+      s.classList.toggle('is-done', i < k);
+      s.classList.toggle('is-pending', i > k);
+      s.setAttribute('aria-current', i === k ? 'step' : 'false');
+    });
+    card.classList.toggle('is-sent', k >= 3);
+  };
+  const stop = () => { clearTimeout(timer); timer = null; };
+  const tick = () => {
+    stop();
+    if (n >= 3) return;
+    timer = setTimeout(() => { show(n + 1); tick(); }, n < 0 ? 250 : STEP_MS);
+  };
+  const play = () => { stop(); if (reduce) { show(3); return; } show(-1); if (inView && !document.hidden) tick(); };
+  steps.forEach((s, i) => s.addEventListener('click', () => { stop(); show(i); }));
+  playBtn.addEventListener('click', play);
+
+  if (reduce || !('IntersectionObserver' in window)) {
+    show(3);
+  } else {
+    demo.classList.add('is-armed');
+    show(-1);
+    new IntersectionObserver(([e]) => {
+      inView = e.isIntersecting;
+      if (inView && !document.hidden) tick(); else stop();
+    }, { threshold: 0.4 }).observe(demo);
+    document.addEventListener('visibilitychange', () => { if (document.hidden) stop(); else if (inView) tick(); });
+  }
+})();
+</script>
+</body>
+</html>
