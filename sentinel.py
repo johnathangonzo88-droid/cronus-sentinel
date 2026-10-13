@@ -42,6 +42,8 @@ HEARTBEAT_READ_TOKEN required for heartbeat endpoints and ENDPOINTS_URL; same va
 ENDPOINTS_URL        optional; the cronus-forms client list (GET /api/sentinel/endpoints).
                      Its active endpoints are monitored alongside ENDPOINTS_JSON. If it can't
                      be reached, the last good copy (kept in the state file) is used.
+SLACK_DEAD_URL       optional; where a Slack webhook that Slack refused for good is reported
+                     (cronus-forms emails the inbox once). Uses HEARTBEAT_READ_TOKEN.
 SEND_MONTHLY         optional; "1" sends every client's branded monthly report now
 REPORTS_DIR          optional; where dry runs write report HTML (default .sentinel/reports)
 SENTINEL_VERBOSE_LOGS optional; "1" prints client names, URLs and alert text
@@ -125,6 +127,7 @@ HEARTBEAT_STATUS_URL = os.getenv("HEARTBEAT_STATUS_URL", "https://cronussignals.
 HEARTBEAT_PING_URL = os.getenv("HEARTBEAT_PING_URL", "https://cronussignals.com/api/hb/{id}")
 HEARTBEAT_READ_TOKEN = os.getenv("HEARTBEAT_READ_TOKEN", "").strip()
 ENDPOINTS_URL = os.getenv("ENDPOINTS_URL", "").strip()
+SLACK_DEAD_URL = os.getenv("SLACK_DEAD_URL", "https://cronussignals.com/api/sentinel/slack-dead")
 SIZE_MIN_SAMPLES = int(os.getenv("SIZE_MIN_SAMPLES", "12"))   # ~1 hour of history before drift alerts
 META_KEY = "__meta__"   # run-level state, kept alongside the per-endpoint entries
 
@@ -1084,6 +1087,44 @@ def slack_text(alert: Alert) -> str:
     return to_plain(alert.text) + (f"\n{links}" if links else "")
 
 
+# Slack answers a failed webhook post with a short error code as the body. These ones mean
+# the webhook will never work again until the client reconnects (or an admin steps in).
+SLACK_PERMANENT = {"no_service", "no_active_hooks", "channel_not_found", "channel_is_archived",
+                   "invalid_token", "no_team", "team_disabled", "team_not_found", "user_not_found",
+                   "action_prohibited", "posting_to_general_channel_denied"}
+SLACK_HINTS = {
+    "no_service": "The webhook was removed (app uninstalled or access revoked): ask the client to reconnect at cronussignals.com/connect.",
+    "channel_not_found": "The channel was deleted: ask the client to reconnect at cronussignals.com/connect.",
+    "channel_is_archived": "The channel was archived: ask the client to unarchive it or reconnect another channel.",
+    "action_prohibited": "A Slack admin restricted posting to that channel.",
+    "invalid_payload": "Cronus sent a message Slack couldn't read: a bug in sentinel.py, not the client.",
+}
+_slack_reported: set[str] = set()   # one report per webhook per run
+
+
+def slack_code(body: str) -> str:
+    """Slack's error code from a webhook response body (never the URL, which is a credential)."""
+    code = body.strip().splitlines()[0] if body.strip() else ""
+    return re.sub(r"[^a-z0-9_]", "", code.lower())[:60] or "(no reason)"
+
+
+async def report_dead_slack(session: aiohttp.ClientSession, webhook: str, reason: str) -> None:
+    """Tell cronus-forms a webhook is dead, so the inbox gets one email (sent only the URL's hash)."""
+    digest = hashlib.sha256(webhook.encode()).hexdigest()
+    if digest in _slack_reported or not HEARTBEAT_READ_TOKEN or not SLACK_DEAD_URL:
+        return
+    _slack_reported.add(digest)
+    try:
+        async with session.post(SLACK_DEAD_URL, json={"hook_sha256": digest, "reason": reason},
+                                headers={"Authorization": f"Bearer {HEARTBEAT_READ_TOKEN}",
+                                         "User-Agent": USER_AGENT},
+                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                print(f"[alert] could not report the dead Slack webhook ({resp.status})", file=sys.stderr)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        print(f"[alert] could not report the dead Slack webhook ({type(exc).__name__})", file=sys.stderr)
+
+
 async def send_slack(session: aiohttp.ClientSession, webhook: str, alert: Alert) -> bool:
     if not webhook:
         return True
@@ -1091,12 +1132,31 @@ async def send_slack(session: aiohttp.ClientSession, webhook: str, alert: Alert)
         if VERBOSE:
             print(f"--- DRY RUN → Slack [{alert.kind.upper()}] ---\n{slack_text(alert)}\n")
         return True
-    try:
-        async with session.post(webhook, json={"text": slack_text(alert)},
-                                timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            return resp.status == 200
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return False
+    for attempt in range(3):
+        try:
+            async with session.post(webhook, json={"text": slack_text(alert)},
+                                    timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return True
+                body = await resp.text()
+                if resp.status == 429 and attempt < 2:   # rate limited: one message per second per channel
+                    try:
+                        wait = float(resp.headers.get("Retry-After", "1"))
+                    except ValueError:
+                        wait = 1.0
+                    await asyncio.sleep(min(max(wait, 1.0), 10))
+                    continue
+                code = slack_code(body)
+                print(f"[alert] Slack {resp.status}: {code}", file=sys.stderr)
+                if IN_ACTIONS:   # the code only, never the webhook URL
+                    print(f"::warning title=cronus-slack::Slack {resp.status}: {code}. {SLACK_HINTS.get(code, '')}".rstrip())
+                if code in SLACK_PERMANENT or resp.status in (404, 410):
+                    await report_dead_slack(session, webhook, f"{resp.status} {code}")
+                return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            print(f"[alert] Slack send error ({type(exc).__name__}), attempt {attempt + 1}", file=sys.stderr)
+            await asyncio.sleep(2)
+    return False
 
 
 async def dispatch(session: aiohttp.ClientSession, alert: Alert) -> bool:

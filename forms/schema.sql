@@ -79,9 +79,26 @@ create index if not exists endpoints_email_idx on endpoints (lower(contact_email
 
 -- Slack channels connected through "Add to Slack". The URL is a credential: never log it.
 create table if not exists slack_hooks (
-  id          integer primary key autoincrement,
-  team        text,
-  channel     text,
-  url         text not null unique,
-  created_at  integer not null
+  id            integer primary key autoincrement,
+  team          text,
+  channel       text,
+  url           text not null unique,
+  created_at    integer not null,
+  team_id       text,                     -- T..., from the OAuth response
+  channel_id    text,                     -- C..., so a reconnect of the same channel is recognised
+  installed_by  text,                     -- U... of the person who clicked Add to Slack
+  status        text not null default 'active',  -- active | removed | dead | replaced
+  removed_at    integer,
+  status_reason text                      -- app_uninstalled, tokens_revoked, or Slack's error (no_service, ...)
 );
+create index if not exists slack_hooks_team_idx on slack_hooks (team_id, channel_id);
+
+-- Databases created before October 2026 need the new slack_hooks columns. Run once
+-- (each line errors harmlessly with "duplicate column" if it's already there):
+--   alter table slack_hooks add column team_id text;
+--   alter table slack_hooks add column channel_id text;
+--   alter table slack_hooks add column installed_by text;
+--   alter table slack_hooks add column status text not null default 'active';
+--   alter table slack_hooks add column removed_at integer;
+--   alter table slack_hooks add column status_reason text;
+--   create index if not exists slack_hooks_team_idx on slack_hooks (team_id, channel_id);
