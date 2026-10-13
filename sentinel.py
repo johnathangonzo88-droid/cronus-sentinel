@@ -37,8 +37,11 @@ CONFIRM_DELAY_S      optional; seconds before re-probing failures (default 20, 0
 REMINDER_EVERY_N     optional; re-alert every N failed checks while down (default 0 = never)
 DRY_RUN              optional; "1" prints alerts instead of sending them
 MAX_CONCURRENCY      optional; parallel probes (default 50)
-HEARTBEAT_READ_TOKEN required for heartbeat endpoints; same value as the cronus-forms
-                     Worker secret of that name
+HEARTBEAT_READ_TOKEN required for heartbeat endpoints and ENDPOINTS_URL; same value as
+                     the cronus-forms Worker secret of that name
+ENDPOINTS_URL        optional; the cronus-forms client list (GET /api/sentinel/endpoints).
+                     Its active endpoints are monitored alongside ENDPOINTS_JSON. If it can't
+                     be reached, the last good copy (kept in the state file) is used.
 SEND_MONTHLY         optional; "1" sends every client's branded monthly report now
 REPORTS_DIR          optional; where dry runs write report HTML (default .sentinel/reports)
 SENTINEL_VERBOSE_LOGS optional; "1" prints client names, URLs and alert text
@@ -63,6 +66,8 @@ import re
 import ssl
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -119,6 +124,7 @@ REPORTS_DIR = Path(os.getenv("REPORTS_DIR", ".sentinel/reports"))
 HEARTBEAT_STATUS_URL = os.getenv("HEARTBEAT_STATUS_URL", "https://cronussignals.com/api/hb/{id}/status")
 HEARTBEAT_PING_URL = os.getenv("HEARTBEAT_PING_URL", "https://cronussignals.com/api/hb/{id}")
 HEARTBEAT_READ_TOKEN = os.getenv("HEARTBEAT_READ_TOKEN", "").strip()
+ENDPOINTS_URL = os.getenv("ENDPOINTS_URL", "").strip()
 SIZE_MIN_SAMPLES = int(os.getenv("SIZE_MIN_SAMPLES", "12"))   # ~1 hour of history before drift alerts
 META_KEY = "__meta__"   # run-level state, kept alongside the per-endpoint entries
 
@@ -200,7 +206,7 @@ class ProbeResult:
     body_bytes: int = 0         # response size, for size-drift tracking
 
 
-REQUIRED = ("client_id", "endpoint_name", "target_url", "telegram_chat_id")
+REQUIRED = ("client_id", "endpoint_name", "target_url")   # plus a telegram_chat_id or slack_webhook_url
 HEARTBEAT_ID_RE = re.compile(r"hb_[0-9a-f]{24}")
 RULES = ("exists", "not_empty", "equals", "not_equals", "min", "max")
 
@@ -222,26 +228,16 @@ def validate_rules(rules: Any) -> str:
     return ""
 
 
-def load_endpoints() -> list[Endpoint]:
-    """Read config from ENDPOINTS_JSON (secret) or the endpoints file."""
-    raw = os.getenv("ENDPOINTS_JSON", "").strip()
-    source = "ENDPOINTS_JSON"
-    if not raw:
-        if not ENDPOINTS_FILE.exists():
-            sys.exit(f"[config] no ENDPOINTS_JSON and {ENDPOINTS_FILE} not found")
-        raw = ENDPOINTS_FILE.read_text(encoding="utf-8")
-        source = str(ENDPOINTS_FILE)
-
-    try:
-        doc = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"[config] invalid JSON in {source}: {exc}", file=sys.stderr)
-        sys.exit(2)
-
-    items = doc.get("endpoints", []) if isinstance(doc, dict) else doc
+def parse_endpoints(items: Any) -> tuple[list[Endpoint], list[str]]:
+    """Validate raw endpoint dicts. Problems name the item by index only (public logs)."""
+    if not isinstance(items, list):
+        return [], ["the endpoint list must be a JSON array (or {\"endpoints\": [...]})"]
     endpoints, problems = [], []
     allowed = set(Endpoint.__dataclass_fields__)
     for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            problems.append(f"endpoint #{i}: must be a JSON object")
+            continue
         if str(item.get("kind", "http")) == "heartbeat":
             hb = str(item.get("heartbeat_id", ""))
             if not HEARTBEAT_ID_RE.fullmatch(hb):
@@ -262,12 +258,15 @@ def load_endpoints() -> list[Endpoint]:
         if missing:
             problems.append(f"endpoint #{i}: missing {', '.join(missing)}")
             continue
+        if not item.get("telegram_chat_id") and not item.get("slack_webhook_url"):
+            problems.append(f"endpoint #{i}: needs a telegram_chat_id or a slack_webhook_url")
+            continue
         url = str(item["target_url"])
         if not url.startswith(("http://", "https://")):
             problems.append(f"endpoint #{i}: target_url must start with http(s)://")
             continue
         clean = {k: v for k, v in item.items() if k in allowed}
-        clean["telegram_chat_id"] = str(clean["telegram_chat_id"])
+        clean["telegram_chat_id"] = str(clean.get("telegram_chat_id") or "")
         clean["method"] = str(clean.get("method", "GET")).upper()
         tz = str(clean.get("timezone") or "")
         if tz:
@@ -281,8 +280,81 @@ def load_endpoints() -> list[Endpoint]:
         if bad_link:
             problems.append(f"endpoint #{i}: {', '.join(bad_link)} must start with https://")
             continue
-        endpoints.append(Endpoint(**clean))
+        try:
+            endpoints.append(Endpoint(**clean))
+        except TypeError:
+            problems.append(f"endpoint #{i}: a field has the wrong type")
+    return endpoints, problems
 
+
+def config_warning(msg: str) -> None:
+    print(f"::warning title=cronus-config::{msg}" if IN_ACTIONS else f"[config] {msg}", file=sys.stdout if IN_ACTIONS else sys.stderr)
+
+
+def fetch_remote_items() -> list[Any]:
+    """GET the client list from the cronus-forms Worker. Raises on any failure."""
+    req = urllib.request.Request(ENDPOINTS_URL, headers={
+        "Authorization": f"Bearer {HEARTBEAT_READ_TOKEN}", "User-Agent": USER_AGENT, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 (fixed https URL from config)
+        doc = json.loads(resp.read(5_000_000).decode("utf-8"))
+    items = doc.get("endpoints") if isinstance(doc, dict) else None
+    if not isinstance(items, list):
+        raise ValueError("response has no endpoints list")
+    return items
+
+
+def load_remote(state: dict[str, Any]) -> list[Endpoint]:
+    """Endpoints from ENDPOINTS_URL, falling back to the last good copy in the state file.
+
+    Bad rows are skipped with a warning instead of stopping the run: one malformed row
+    in the database must never switch off monitoring for everyone else.
+    """
+    if not ENDPOINTS_URL:
+        return []
+    meta = state.setdefault(META_KEY, {})
+    if not HEARTBEAT_READ_TOKEN:
+        config_warning("ENDPOINTS_URL is set but HEARTBEAT_READ_TOKEN is not; the client list was not loaded")
+        items = meta.get("remote_endpoints") or []
+    else:
+        try:
+            items = fetch_remote_items()
+            meta["remote_endpoints"] = items
+            meta["remote_at"] = utc_now()
+        except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            items = meta.get("remote_endpoints")
+            if items is None:
+                config_warning(f"client list unreachable ({type(exc).__name__}) and no saved copy yet; "
+                               "only ENDPOINTS_JSON is monitored this run")
+                return []
+            config_warning(f"client list unreachable ({type(exc).__name__}); using the copy saved "
+                           f"{meta.get('remote_at') or 'earlier'}")
+    endpoints, problems = parse_endpoints(items)
+    if problems:
+        config_warning(f"{len(problems)} row(s) in the client list skipped as invalid: " + "; ".join(problems)[:500])
+    return endpoints
+
+
+def load_endpoints(state: dict[str, Any] | None = None) -> list[Endpoint]:
+    """ENDPOINTS_JSON (secret) or the endpoints file, plus the client list from ENDPOINTS_URL."""
+    raw = os.getenv("ENDPOINTS_JSON", "").strip()
+    source = "ENDPOINTS_JSON"
+    if not raw:
+        if ENDPOINTS_URL:
+            raw, source = "[]", "(none)"   # the example file is never monitored for real
+        elif not ENDPOINTS_FILE.exists():
+            sys.exit(f"[config] no ENDPOINTS_JSON and {ENDPOINTS_FILE} not found")
+        else:
+            raw = ENDPOINTS_FILE.read_text(encoding="utf-8")
+            source = str(ENDPOINTS_FILE)
+
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"[config] invalid JSON in {source}: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+    items = doc.get("endpoints", []) if isinstance(doc, dict) else doc
+    endpoints, problems = parse_endpoints(items)
     if problems:
         print("[config] " + "\n[config] ".join(problems), file=sys.stderr)
         sys.exit(2)
@@ -294,7 +366,22 @@ def load_endpoints() -> list[Endpoint]:
         print(f"[config] duplicate client_id+endpoint_name: {shown}", file=sys.stderr)
         sys.exit(2)
 
-    return [e for e in endpoints if e.enabled]
+    # The database list adds to the secret; on a clash the secret's entry wins.
+    remote = load_remote(state if state is not None else {})
+    seen, clashes, kept = set(keys), 0, []
+    for ep in remote:
+        if ep.key in seen:
+            clashes += 1
+            continue
+        seen.add(ep.key)
+        kept.append(ep)
+    if clashes:
+        config_warning(f"{clashes} client-list endpoint(s) also in ENDPOINTS_JSON; the ENDPOINTS_JSON entry is used")
+    if ENDPOINTS_URL:
+        line = f"{len(endpoints)} from ENDPOINTS_JSON + {len(kept)} from the client list"
+        print(f"::notice title=cronus-config::{line}" if IN_ACTIONS else f"[config] {line}")
+
+    return [e for e in endpoints + kept if e.enabled]
 
 
 def load_state() -> dict[str, Any]:
@@ -941,6 +1028,8 @@ def telegram_error_line(status: int, chat_id: str, body: str) -> str:
 
 
 async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Alert) -> bool:
+    if not chat_id:      # a Slack-only client
+        return True
     text = alert.text
     if len(text) > TELEGRAM_MAX:  # only a huge URL could do this; keep the card sendable
         text = text[: TELEGRAM_MAX - 1] + "…"
@@ -1544,11 +1633,14 @@ async def deliver_monthly(session: aiohttp.ClientSession, eps: list[Endpoint],
         print(f"--- DRY RUN → monthly report written to {REPORTS_DIR / name}"
               if VERBOSE else "--- DRY RUN → monthly report written (set SENTINEL_VERBOSE_LOGS=1 for the path)")
         return True
-    ok = await send_telegram_document(session, ep.telegram_chat_id, name, page, caption)
+    ok = True
+    if ep.telegram_chat_id:
+        ok = await send_telegram_document(session, ep.telegram_chat_id, name, page, caption)
     if ep.slack_webhook_url:  # Slack incoming webhooks can't carry files: send the numbers
+        where = ("The full page was sent to your Telegram group and" if ep.telegram_chat_id
+                 else "Slack can't carry the file itself; ask Cronus for the full page, which")
         ok = await send_slack(session, ep.slack_webhook_url,
-                              Alert(ep, "monthly", caption.replace("The attached page",
-                                    "The full page was sent to your Telegram group and"))) and ok
+                              Alert(ep, "monthly", caption.replace("The attached page", where))) and ok
     return ok
 
 
@@ -1583,8 +1675,8 @@ async def send_monthly(session: aiohttp.ClientSession, endpoints: list[Endpoint]
 # Main run
 # --------------------------------------------------------------------------- #
 async def run() -> int:
-    endpoints = load_endpoints()
     state = load_state()
+    endpoints = load_endpoints(state)
     if not endpoints:
         print("[sentinel] no enabled endpoints — nothing to do")
         return 0

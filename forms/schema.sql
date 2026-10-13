@@ -43,3 +43,45 @@ create table if not exists heartbeats (
   last_ping   integer,                    -- ms since epoch; null until the first check-in
   pings       integer not null default 0
 );
+
+-- Telegram groups that added @cronus_alerts_bot (written by the /api/telegram/webhook handler).
+create table if not exists telegram_chats (
+  chat_id     text primary key,
+  title       text,
+  type        text,                       -- group | supergroup
+  status      text not null,              -- active | removed | migrated
+  added_by    text,
+  first_seen  integer not null,           -- ms since epoch
+  updated_at  integer not null
+);
+
+-- Monitored endpoints. Forms save them as 'pending'; the operator activates a client by
+-- clicking "Send alerts here" in a Telegram/Slack connected email (or the endpoint list email).
+-- sentinel.py reads the active rows from GET /api/sentinel/endpoints every run.
+create table if not exists endpoints (
+  client_id          text not null,            -- agency-slug--client-slug
+  endpoint_name      text not null,
+  target_url         text not null,
+  config             text not null default '{}', -- other sentinel.py fields as JSON (expected_status, method, ...)
+  agency             text,
+  contact_email      text,
+  source             text not null,            -- pilot | pro | manual
+  telegram_chat_id   text,
+  slack_webhook_url  text,
+  status             text not null default 'pending',  -- pending | active | paused
+  created_at         integer not null,         -- ms since epoch
+  updated_at         integer not null,
+  activated_at       integer,
+  primary key (client_id, endpoint_name)
+);
+create index if not exists endpoints_status_idx on endpoints (status);
+create index if not exists endpoints_email_idx on endpoints (lower(contact_email));
+
+-- Slack channels connected through "Add to Slack". The URL is a credential: never log it.
+create table if not exists slack_hooks (
+  id          integer primary key autoincrement,
+  team        text,
+  channel     text,
+  url         text not null unique,
+  created_at  integer not null
+);

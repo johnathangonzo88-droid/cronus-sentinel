@@ -11,7 +11,7 @@ mkdirSync(`${here}.test`, { recursive: true });
 const src = readFileSync(`${here}worker.js`, 'utf8')
   .replace("import { EmailMessage } from 'cloudflare:email';",
     'class EmailMessage { constructor(from, to, raw) { this.from = from; this.to = to; this.raw = raw; } }')
-  + '\nexport const _test = { verifyStripe, claimEvent, dailyCheck, STALE_CLAIM_MS, NUDGE_AFTER_MS };\n';
+  + '\nexport const _test = { verifyStripe, claimEvent, dailyCheck, signLink, STALE_CLAIM_MS, NUDGE_AFTER_MS };\n';
 writeFileSync(`${here}.test/worker.mjs`, src);
 const { default: W, _test } = await import(`${here}.test/worker.mjs`);
 
@@ -292,6 +292,202 @@ await test('heartbeats: registered ids record check-ins, unknown ids are refused
   assert.equal((await status(id, null)).status, 401);
   delete env.HEARTBEAT_READ_TOKEN;
   assert.equal((await status(id, 'readtok')).status, 401);           // no token configured: closed
+});
+
+// ---- clients in D1: forms save pending rows, signed links activate them --------
+const BASE = 'https://cronussignals.com';
+const actLinks = (raw) => raw.match(/https:\/\/cronussignals\.com\/api\/admin\/act\?t=\S+/g) ?? [];
+const rowsOf = (env) => env.DB.sql.prepare('select * from endpoints order by client_id, endpoint_name').all();
+function clientEnv() {
+  const e = makeEnv();
+  Object.assign(e.env, { ADMIN_LINK_SECRET: 'linksecret', HEARTBEAT_READ_TOKEN: 'readtok', TELEGRAM_WEBHOOK_SECRET: 'tgsecret' });
+  return e;
+}
+const pilotForm = (agency = 'Bright Pixel', urls = ['https://shop.co/api/health', 'https://shop.co/api/health']) =>
+  new Request(`${BASE}/api/pilot`, { method: 'POST', headers: { origin: BASE, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'Bo', email: 'bo@bright.co', agency, url1: urls[0], url2: urls[1], elapsed: 9000 }) });
+const tgUpdate = (body, secret = 'tgsecret') => new Request(`${BASE}/api/telegram/webhook`, {
+  method: 'POST', headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': secret }, body: JSON.stringify(body) });
+const joined = (id = -100555, title = 'Bright Pixel alerts') => ({ my_chat_member: {
+  chat: { id, title, type: 'supergroup' }, from: { first_name: 'Bo' },
+  old_chat_member: { status: 'left' }, new_chat_member: { status: 'member' } } });
+const sentinelRead = async (env, tok = 'readtok') => W.fetch(new Request(`${BASE}/api/sentinel/endpoints`,
+  { headers: tok ? { authorization: `Bearer ${tok}` } : {} }), env);
+const act = (link, method = 'GET') => {
+  if (method === 'GET') return new Request(link);
+  const t = new URL(link).searchParams.get('t');
+  return new Request(`${BASE}/api/admin/act`, { method: 'POST', body: new URLSearchParams({ t }),
+    headers: { 'content-type': 'application/x-www-form-urlencoded' } });
+};
+
+await test('pilot form saves its URLs as pending; nothing is monitored yet', async () => {
+  const { env, sent } = clientEnv();
+  assert.equal((await W.fetch(pilotForm(), env)).status, 200);
+  const rows = rowsOf(env);
+  assert.deepEqual(rows.map((r) => [r.client_id, r.endpoint_name, r.status, r.source]), [
+    ['bright-pixel--pilot', 'shop.co/api/health', 'pending', 'pilot'],
+    ['bright-pixel--pilot', 'shop.co/api/health (2)', 'pending', 'pilot'],
+  ]);
+  assert.match(sent[0], /Saved as pending for client_id bright-pixel--pilot: 2 endpoints/);
+  assert.match(sent[0], /When they add @cronus_alerts_bot or connect Slack/);
+  assert.deepEqual((await (await sentinelRead(env)).json()).endpoints, []);
+});
+
+await test('Telegram connected email links pending clients; GET only previews, POST activates', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  assert.equal((await W.fetch(tgUpdate(joined()), env)).status, 200);
+  const mail = sent.at(-1);
+  assert.match(header(mail, 'Subject'), /^Telegram connected/);
+  assert.match(mail, /agency-co--shop {2}\(1 endpoint, Agency Co, ana@agency\.co\)/);
+  const [link] = actLinks(mail);
+  assert.ok(link);
+
+  const preview = await W.fetch(act(link), env);
+  assert.equal(preview.status, 200);
+  const html = await preview.text();
+  assert.match(html, /https:\/\/shop\.co\/hook/);
+  assert.match(html, /Telegram group &quot;Bright Pixel alerts&quot;/);
+  assert.match(preview.headers.get('content-security-policy'), /default-src 'none'/);
+  assert.equal(rowsOf(env)[0].status, 'pending');            // a mail scanner's GET changes nothing
+
+  const done = await W.fetch(act(link, 'POST'), env);
+  assert.equal(done.status, 200);
+  assert.match(await done.text(), /1 endpoint active[\s\S]*test_client/);
+  assert.equal(rowsOf(env)[0].status, 'active');
+  const list = (await (await sentinelRead(env)).json()).endpoints;
+  assert.deepEqual(list, [{ expected_status: [200], client_id: 'agency-co--shop', endpoint_name: 'Orders webhook',
+    target_url: 'https://shop.co/hook', telegram_chat_id: '-100555' }]);
+});
+
+await test('endpoint list arriving after Telegram links to the unused chat', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(tgUpdate(joined()), env);
+  assert.match(sent[0], /No endpoint lists are waiting/);
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  const mail = sent.at(-1);
+  assert.match(mail, /agency-co--shop -> Telegram group "Bright Pixel alerts"/);
+  await W.fetch(act(actLinks(mail)[0], 'POST'), env);
+  assert.equal(rowsOf(env)[0].telegram_chat_id, '-100555');
+  // Once in use, the chat is no longer offered to the next list.
+  await W.fetch(pilotForm('Other Agency', ['https://o.co/h', '']), env);
+  assert.equal(actLinks(sent.at(-1)).length, 0);
+});
+
+await test('a public form can never change an active endpoint', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  await W.fetch(tgUpdate(joined()), env);
+  await W.fetch(act(actLinks(sent.at(-1))[0], 'POST'), env);
+  const evil = new Request(`${BASE}/api/endpoints`, { method: 'POST', headers: { origin: BASE, 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'X', email: 'x@evil.co', agency: 'Agency Co', elapsed: 9000,
+      rows: [{ client: 'Shop', label: 'Orders webhook', url: 'https://evil.co/', expect: '' }] }) });
+  assert.equal((await W.fetch(evil, env)).status, 200);
+  const [r] = rowsOf(env);
+  assert.equal(r.target_url, 'https://shop.co/hook');
+  assert.equal(r.contact_email, 'ana@agency.co');
+  assert.match(sent.at(-1), /NOT changed by this form[\s\S]*agency-co--shop \/ Orders webhook/);
+});
+
+await test('tampered, expired or unsigned links do nothing', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  await W.fetch(tgUpdate(joined()), env);
+  const link = actLinks(sent.at(-1))[0];
+  const t = new URL(link).searchParams.get('t');
+  const forged = `${BASE}/api/admin/act?t=${t.split('.')[0]}.AAAA`;
+  assert.equal((await W.fetch(act(forged, 'POST'), env)).status, 400);
+  const expired = await _test.signLink(env, { a: 'assign', c: 'agency-co--shop', d: 'tg:-100555', e: Date.now() - 1 });
+  assert.equal((await W.fetch(act(expired, 'POST'), env)).status, 400);
+  const wrongKey = await _test.signLink({ ADMIN_LINK_SECRET: 'other' }, { a: 'assign', c: 'agency-co--shop', d: 'tg:-100555', e: Date.now() + 9e6 });
+  assert.equal((await W.fetch(act(wrongKey, 'POST'), env)).status, 400);
+  const unknown = await _test.signLink(env, { a: 'delete_all', c: 'agency-co--shop', e: Date.now() + 9e6 });
+  assert.equal((await W.fetch(act(unknown, 'POST'), env)).status, 400);
+  assert.equal(rowsOf(env)[0].status, 'pending');
+  delete env.ADMIN_LINK_SECRET;
+  assert.equal((await W.fetch(act(link, 'POST'), env)).status, 400);
+  await W.fetch(tgUpdate(joined(-100777, 'Second')), env);
+  assert.match(sent.at(-1), /One-click links are off/);
+});
+
+await test('a chat the bot was removed from cannot be assigned', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  await W.fetch(tgUpdate(joined()), env);
+  const link = actLinks(sent.at(-1))[0];
+  const gone = joined(); gone.my_chat_member.old_chat_member.status = 'member'; gone.my_chat_member.new_chat_member.status = 'kicked';
+  await W.fetch(tgUpdate(gone), env);
+  assert.equal((await W.fetch(act(link, 'POST'), env)).status, 409);
+  assert.equal(rowsOf(env)[0].status, 'pending');
+});
+
+await test('pause and resume from the result page; cancellation email pauses by email', async () => {
+  const { env, sent } = clientEnv();
+  await post(env, checkout());
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  await W.fetch(tgUpdate(joined()), env);
+  const done = await (await W.fetch(act(actLinks(sent.at(-1))[0], 'POST'), env)).text();
+  const pause = done.match(/href="([^"]+)">pause later/)[1].replace(/&amp;/g, '&');
+  await W.fetch(act(pause, 'POST'), env);
+  assert.equal(rowsOf(env)[0].status, 'paused');
+  assert.deepEqual((await (await sentinelRead(env)).json()).endpoints, []);
+  const resumePage = await (await W.fetch(act(pause, 'POST'), env)).text();   // already paused
+  assert.match(resumePage, /Nothing to do/);
+  // resume, then cancel the subscription
+  const resume = await _test.signLink(env, { a: 'resume', c: 'agency-co--shop', e: Date.now() + 9e6 });
+  await W.fetch(act(resume, 'POST'), env);
+  assert.equal(rowsOf(env)[0].status, 'active');
+  await post(env, subDeleted());
+  const cancelMail = sent.at(-1);
+  assert.match(header(cancelMail, 'Subject'), /^Cancelled/);
+  const [stop] = actLinks(cancelMail);
+  assert.match(await (await W.fetch(act(stop), env)).text(), /every endpoint submitted from <b>ana@agency\.co/);
+  await W.fetch(act(stop, 'POST'), env);
+  assert.equal(rowsOf(env)[0].status, 'paused');
+});
+
+await test('Slack channel assignment uses the stored hook', async () => {
+  const { env } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  env.DB.sql.prepare('insert into slack_hooks (team, channel, url, created_at) values (?, ?, ?, ?)')
+    .run('Agency Co', '#alerts', 'https://hooks.slack.com/services/T/B/x', Date.now());
+  const link = await _test.signLink(env, { a: 'assign', c: 'agency-co--shop', d: 'sl:1', e: Date.now() + 9e6 });
+  assert.match(await (await W.fetch(act(link), env)).text(), /Slack #alerts in Agency Co/);
+  await W.fetch(act(link, 'POST'), env);
+  const [e] = (await (await sentinelRead(env)).json()).endpoints;
+  assert.equal(e.slack_webhook_url, 'https://hooks.slack.com/services/T/B/x');
+  assert.equal(e.telegram_chat_id, '');
+});
+
+await test('group upgraded to a supergroup: endpoints follow the new chat id', async () => {
+  const { env, sent } = clientEnv();
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  await W.fetch(tgUpdate(joined(-555, 'Small group')), env);
+  await W.fetch(act(actLinks(sent.at(-1))[0], 'POST'), env);
+  await W.fetch(tgUpdate({ message: { chat: { id: -555, title: 'Small group', type: 'group' }, migrate_to_chat_id: -100999 } }), env);
+  assert.equal(rowsOf(env)[0].telegram_chat_id, '-100999');
+  assert.match(sent.at(-1), /Updated 1 endpoint in the database automatically/);
+});
+
+await test('sentinel read API: token required; stored config cannot override core fields', async () => {
+  const { env } = clientEnv();
+  env.DB.sql.prepare(`insert into endpoints (client_id, endpoint_name, target_url, config, source, telegram_chat_id, status, created_at, updated_at)
+    values ('a--b', 'API', 'https://a.co', ?, 'manual', '-1', 'active', 1, 1)`)
+    .run(JSON.stringify({ client_id: 'x', target_url: 'https://evil.co', method: 'HEAD', json_rules: [{ path: 'ok', rule: 'exists' }] }));
+  env.DB.sql.prepare(`insert into endpoints (client_id, endpoint_name, target_url, source, status, created_at, updated_at)
+    values ('a--b', 'No chat yet', 'https://a.co/2', 'manual', 'active', 1, 1)`).run();
+  assert.equal((await sentinelRead(env, 'wrong')).status, 401);
+  assert.equal((await sentinelRead(env, null)).status, 401);
+  const r = await sentinelRead(env);
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  const { endpoints } = await r.json();
+  assert.equal(endpoints.length, 1);                      // no destination yet: not returned
+  assert.equal(endpoints[0].client_id, 'a--b');
+  assert.equal(endpoints[0].target_url, 'https://a.co');
+  assert.equal(endpoints[0].method, 'HEAD');
+  assert.deepEqual(endpoints[0].json_rules, [{ path: 'ok', rule: 'exists' }]);
+  delete env.HEARTBEAT_READ_TOKEN;
+  assert.equal((await sentinelRead(env, 'readtok')).status, 401);
 });
 
 console.log(`\nall ${n} checks passed`);

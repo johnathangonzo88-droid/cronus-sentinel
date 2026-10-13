@@ -12,6 +12,11 @@
 //                             already registered in the heartbeats table are accepted.
 //   GET  /api/hb/<id>/status  When that heartbeat last checked in (Bearer HEARTBEAT_READ_TOKEN);
 //                             read by sentinel.py every 5 minutes.
+//   POST /api/telegram/webhook Telegram: the alerts bot was added to / removed from a group.
+//   GET|POST /api/admin/act   Signed one-click links from the inbox emails: activate a client's
+//                             endpoints on a chat, pause or resume them.
+//   GET  /api/sentinel/endpoints  Active endpoints from D1 (Bearer HEARTBEAT_READ_TOKEN); read
+//                             by sentinel.py every run, alongside its ENDPOINTS_JSON secret.
 //   daily cron                Emails a reminder about paid clients with no endpoint list after 48h.
 //
 // Setup (Cloudflare → Workers & Pages → cronus-forms):
@@ -25,6 +30,7 @@
 //   Secret   STRIPE_WEBHOOK_SECRET  (secret)      whsec_... from Stripe → Developers → Webhooks
 //   Secret   HEARTBEAT_READ_TOKEN   (secret)      any long random string; the same value goes in the
 //                                                 cronus-sentinel GitHub secret of that name
+//   Secret   ADMIN_LINK_SECRET      (secret)      any long random string; signs the one-click links
 //
 // Spam handling: a hidden honeypot field, a minimum fill time, length limits and URL checks.
 
@@ -62,7 +68,7 @@ function validate(d) {
   return [f, null];
 }
 
-function buildMessage(f) {
+function buildMessage(f, extra = []) {
   const id = `<${crypto.randomUUID()}@cronussignals.com>`;
   const body = [
     'New Cronus pilot request',
@@ -78,6 +84,7 @@ function buildMessage(f) {
     'Notes:',
     f.notes || '  (none)',
     '',
+    ...(extra.length ? [...extra, ''] : []),
     '--',
     'Reply to this email to answer them directly. Next steps: ONBOARDING.md in cronus-sentinel.',
   ].join('\r\n');
@@ -114,8 +121,19 @@ async function handlePilot(request, env) {
   const [f, err] = validate(d);
   if (err) return json({ ok: false, error: err }, 400);
 
+  const clientId = `${slugId(f.agency) || 'agency'}--pilot`.slice(0, 64);
+  const names = new Set();
+  const rows = f.urls.map((u) => {
+    let name = urlLabel(u);
+    for (let k = 2; names.has(name.toLowerCase()); k++) name = `${urlLabel(u)} (${k})`;
+    names.add(name.toLowerCase());
+    return { client_id: clientId, endpoint_name: name, target_url: u, config: {} };
+  });
+  const saved = await quietly('save pilot', () => saveEndpoints(env, rows, { agency: f.agency, email: f.email, source: 'pilot' }), null);
+  const extra = [...savedLines(saved, [clientId]), '', ...await quietly('pilot links', () => openDestinationLines(env, [clientId]), [])];
+
   try {
-    await env.MAILER.send(new EmailMessage(FROM, TO, buildMessage(f)));
+    await env.MAILER.send(new EmailMessage(FROM, TO, buildMessage(f, extra)));
   } catch (e) {
     console.log('send failed', String(e));
     return json({ ok: false, error: 'send failed' }, 502);
@@ -166,23 +184,36 @@ function validateEndpoints(d) {
   return [f, null];
 }
 
-function endpointsMessage(f) {
-  const agencyId = slugId(f.agency);
+// One D1 row per form row. client_id = agency-slug--client-slug.
+function endpointRows(f) {
+  const agencyId = slugId(f.agency) || 'agency';
+  return f.rows.map((r) => ({
+    client_id: `${agencyId}--${slugId(r.client) || 'client'}`.slice(0, 64),
+    endpoint_name: r.label,
+    target_url: r.url,
+    config: r.codes.length ? { expected_status: r.codes } : {},
+  }));
+}
+
+function savedLines(saved, clientIds) {
+  if (!saved) return ['Could NOT save these to the database (see the Worker logs). Add them to ENDPOINTS_JSON by hand.'];
+  const lines = [
+    `Saved as pending for client_id ${clientIds.join(', ')}: ${plural(saved.saved, 'endpoint')}.`,
+    'Nothing is checked until you activate it with one of the links below.',
+  ];
+  if (saved.unchanged.length) {
+    lines.push('', 'Already active or paused, so NOT changed by this form (edit them in D1 if this is really them):',
+      ...saved.unchanged.map((x) => `  - ${x}`));
+  }
+  return lines;
+}
+
+function endpointsMessage(f, extra = []) {
   const byClient = new Map();
   for (const r of f.rows) {
     if (!byClient.has(r.client)) byClient.set(r.client, []);
     byClient.get(r.client).push(r);
   }
-  const entries = f.rows.map((r) => {
-    const e = {
-      client_id: `${agencyId}--${slugId(r.client)}`.slice(0, 64),
-      endpoint_name: r.label,
-      target_url: r.url,
-      telegram_chat_id: '',
-    };
-    if (r.codes.length) e.expected_status = r.codes;
-    return e;
-  });
   const body = [
     `Endpoint list from ${f.agency}`,
     '',
@@ -197,11 +228,10 @@ function endpointsMessage(f) {
     'Notes:',
     f.notes || '  (none)',
     '',
-    '--',
-    'Entries for ENDPOINTS_JSON. Fill in each client\'s telegram_chat_id, or replace it with',
-    'slack_webhook_url from their "Slack connected" email, then add them to the list and run a test alert.',
+    ...extra,
     '',
-    JSON.stringify(entries, null, 2),
+    '--',
+    'Reply to this email to write to them directly.',
   ].join('\r\n');
   return [
     `From: Cronus endpoints form <${FROM}>`,
@@ -227,8 +257,12 @@ async function handleEndpoints(request, env) {
   if (d.website || Number(d.elapsed) < 3000) return json({ ok: true });
   const [f, err] = validateEndpoints(d);
   if (err) return json({ ok: false, error: err }, 400);
+  const rows = endpointRows(f);
+  const ids = [...new Set(rows.map((r) => r.client_id))];
+  const saved = await quietly('save endpoints', () => saveEndpoints(env, rows, { agency: f.agency, email: f.email, source: 'pro' }), null);
+  const extra = [...savedLines(saved, ids), '', ...await quietly('endpoint links', () => openDestinationLines(env, ids), [])];
   try {
-    await env.MAILER.send(new EmailMessage(FROM, TO, endpointsMessage(f)));
+    await env.MAILER.send(new EmailMessage(FROM, TO, endpointsMessage(f, extra)));
   } catch (e) {
     console.log('send failed', String(e));
     return json({ ok: false, error: 'send failed' }, 502);
@@ -268,7 +302,7 @@ async function checkState(secret, state, now = Date.now()) {
 
 const back = (params) => Response.redirect(`${ORIGIN}/connect?${new URLSearchParams(params)}`, 302);
 
-function slackEmail(team, hook) {
+function slackEmail(team, hook, extra = []) {
   const body = [
     'A client connected Slack to Cronus.',
     '',
@@ -278,10 +312,9 @@ function slackEmail(team, hook) {
     'Webhook URL (treat it like a password):',
     hook.url,
     '',
-    'For each of their endpoints in ENDPOINTS_JSON:',
-    `  "slack_webhook_url": "${hook.url}"`,
+    ...extra,
     '',
-    'Then run the workflow with test_alert ticked so they see a TEST card in that channel.',
+    '(Clients still in ENDPOINTS_JSON instead: add "slack_webhook_url" with the URL above.)',
     hook.configuration_url ? `They can remove it any time: ${hook.configuration_url}` : '',
   ].join('\r\n');
   return [
@@ -343,9 +376,18 @@ async function handleSlack(url, env) {
   hook.channel = oneLine(hook.channel ?? '', 120);
   hook.channel_id = oneLine(hook.channel_id ?? '', 40);
 
+  const hookId = await quietly('save slack hook', async () => {
+    await env.DB.prepare(
+      `insert into slack_hooks (team, channel, url, created_at) values (?, ?, ?, ?)
+       on conflict (url) do update set team = excluded.team, channel = excluded.channel, created_at = excluded.created_at`,
+    ).bind(team.name, hook.channel, hook.url, Date.now()).run();
+    return (await env.DB.prepare('select id from slack_hooks where url = ?').bind(hook.url).first())?.id ?? null;
+  }, null);
+  const extra = hookId == null ? [] : await quietly('slack links', () => pendingClientLines(env, `sl:${hookId}`), []);
+
   // The webhook is only useful if it reaches the inbox: no email, no success page.
   try {
-    await env.MAILER.send(new EmailMessage(FROM, TO, slackEmail(team, hook)));
+    await env.MAILER.send(new EmailMessage(FROM, TO, slackEmail(team, hook, extra)));
   } catch (e) {
     console.log('slack email failed', String(e));
     return back({ slack: 'error' });
@@ -515,10 +557,13 @@ async function onSubscriptionDeleted(sub, env) {
         sub.cancellation_details?.reason ? `Reason:   ${sub.cancellation_details.reason}` : '',
         sub.cancellation_details?.feedback ? `Feedback: ${sub.cancellation_details.feedback}` : '',
         '',
-        'To do:',
-        `  1. Remove their entries from ENDPOINTS_JSON (search your inbox for "Endpoint list" from ${c.email}).`,
-        '  2. That stops monitoring and alerts. Their Slack webhook goes unused; they can remove the',
-        '     Cronus app from their workspace whenever they like.',
+        'To do: stop monitoring their endpoints.',
+        ...(await quietly('pause link', async () => {
+          const link = await signLink(env, { a: 'pause_email', m: c.email, e: Date.now() + PAUSE_TTL_MS });
+          return link ? ['  Pause everything they submitted (review first, one click):', `  ${link}`] : NO_LINKS;
+        }, NO_LINKS)),
+        `  Anything of theirs still in ENDPOINTS_JSON: remove it there (search "Endpoint list" from ${c.email}).`,
+        '  Their Slack webhook goes unused; they can remove the Cronus app from their workspace any time.',
         '',
         'Reply to this email if you want to ask them why they left.',
       ],
@@ -669,13 +714,303 @@ async function handleHeartbeat(request, env, path, now = Date.now()) {
   return json({ ok: true });
 }
 
+// ---------------------------------------------------------------------------
+// Clients: monitored endpoints live in D1 (table endpoints).
+//
+//   Forms save a client's endpoints as 'pending'. The "connected" emails (Telegram,
+//   Slack) and the endpoint-list emails carry signed one-click links:
+//     GET  /api/admin/act?t=...   shows what the link will do (safe for mail scanners)
+//     POST /api/admin/act         does it: activate a client's endpoints on a chat,
+//                                 pause them, or resume them
+//   GET  /api/sentinel/endpoints  the active endpoints, read by sentinel.py every run
+//                                 (Bearer HEARTBEAT_READ_TOKEN)
+//
+// Setup: Secret ADMIN_LINK_SECRET (any long random string) signs the links. Without
+// it the emails say so and nothing can be activated by link.
+// ---------------------------------------------------------------------------
+const ASSIGN_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const PAUSE_TTL_MS = 120 * 24 * 60 * 60 * 1000;
+const RECENT_MS = 30 * 24 * 60 * 60 * 1000;
+const CORE_FIELDS = ['client_id', 'endpoint_name', 'target_url', 'telegram_chat_id', 'slack_webhook_url', 'enabled'];
+
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+// A short readable name for a URL, used when the pilot form gives no label.
+function urlLabel(u) {
+  try {
+    const x = new URL(u);
+    return oneLine(`${x.host}${x.pathname === '/' ? '' : x.pathname}`, 90);
+  } catch {
+    return oneLine(u, 90);
+  }
+}
+
+// Bookkeeping must never stop an email or a form from going through.
+async function quietly(what, fn, fallback) {
+  try { return await fn(); } catch (e) { console.log(`${what} failed`, String(e?.stack ?? e)); return fallback; }
+}
+
+// Upsert rows as pending. A row that is already active or paused is left untouched: the
+// forms are public, so a submission must never change what is being monitored.
+async function saveEndpoints(env, rows, meta, now = Date.now()) {
+  const out = { saved: 0, unchanged: [] };
+  if (!env.DB) return null;
+  const stmt = env.DB.prepare(
+    `insert into endpoints (client_id, endpoint_name, target_url, config, agency, contact_email, source, status, created_at, updated_at)
+     values (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+     on conflict (client_id, endpoint_name) do update set target_url = excluded.target_url, config = excluded.config,
+       agency = excluded.agency, contact_email = excluded.contact_email, updated_at = excluded.updated_at
+     where endpoints.status = 'pending'`,
+  );
+  for (const r of rows) {
+    const res = await stmt.bind(r.client_id, r.endpoint_name, r.target_url, JSON.stringify(r.config ?? {}),
+      meta.agency, meta.email, meta.source, now, now).run();
+    if (res.meta.changes) out.saved += 1;
+    else out.unchanged.push(`${r.client_id} / ${r.endpoint_name}`);
+  }
+  return out;
+}
+
+// ---- signed links ---------------------------------------------------------
+const b64urlText = (s) => b64url(new TextEncoder().encode(s));
+function unb64url(s) {
+  const b = atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4));
+  return new TextDecoder().decode(Uint8Array.from(b, (c) => c.charCodeAt(0)));
+}
+
+async function signLink(env, payload) {
+  if (!env.ADMIN_LINK_SECRET) return null;
+  const body = b64urlText(JSON.stringify(payload));
+  return `${ORIGIN}/api/admin/act?t=${body}.${await hmac(env.ADMIN_LINK_SECRET, body)}`;
+}
+
+async function readLink(env, token, now = Date.now()) {
+  if (!env.ADMIN_LINK_SECRET) return null;
+  const parts = String(token ?? '').split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  if (!sameString(await hmac(env.ADMIN_LINK_SECRET, parts[0]), parts[1])) return null;
+  let p;
+  try { p = JSON.parse(unb64url(parts[0])); } catch { return null; }
+  if (!p || typeof p !== 'object' || !(Number(p.e) > now)) return null;
+  return p;
+}
+
+const NO_LINKS = ['(One-click links are off: set the ADMIN_LINK_SECRET secret on the cronus-forms Worker.)'];
+
+// ---- destinations (Telegram groups, Slack channels) -----------------------
+async function destInfo(env, d) {
+  const [kind, id] = String(d ?? '').split(/:(.*)/s);
+  if (kind === 'tg') {
+    const row = await env.DB.prepare('select chat_id, title, status from telegram_chats where chat_id = ?').bind(id).first();
+    if (!row || row.status !== 'active') return null;
+    return { label: `Telegram group "${row.title || row.chat_id}"`, tg: row.chat_id };
+  }
+  if (kind === 'sl') {
+    const row = await env.DB.prepare('select id, team, channel, url from slack_hooks where id = ?').bind(Number(id)).first();
+    if (!row) return null;
+    return { label: `Slack ${row.channel || 'channel'} in ${row.team || 'their workspace'}`, sl: row.url };
+  }
+  return null;
+}
+
+// Lines for a "connected" email: one activate link per client still waiting for a channel.
+async function pendingClientLines(env, dest, now = Date.now()) {
+  if (!env.DB) return [];
+  const { results } = await env.DB.prepare(
+    `select client_id, count(*) as n, max(agency) as agency, max(contact_email) as email, max(created_at) as at
+     from endpoints where status = 'pending' and created_at > ? group by client_id order by at desc limit 10`,
+  ).bind(now - RECENT_MS).all();
+  if (!results.length) {
+    return ['No endpoint lists are waiting right now. When one arrives, its email will have a link to this chat.'];
+  }
+  if (!env.ADMIN_LINK_SECRET) return NO_LINKS;
+  const lines = ['Whose alerts should go here? Click to review, then activate:', ''];
+  for (const r of results) {
+    lines.push(`  ${r.client_id}  (${plural(r.n, 'endpoint')}, ${r.agency || '?'}, ${r.email || '?'})`);
+    lines.push(`  ${await signLink(env, { a: 'assign', c: r.client_id, d: dest, e: now + ASSIGN_TTL_MS })}`, '');
+  }
+  return lines;
+}
+
+// Lines for an endpoint-list email: links to send each client's alerts to a chat that
+// was connected recently and isn't used by anyone yet.
+async function openDestinationLines(env, clientIds, now = Date.now()) {
+  if (!env.DB) return [];
+  const since = now - RECENT_MS;
+  const tg = (await env.DB.prepare(
+    `select chat_id, title from telegram_chats where status = 'active' and updated_at > ?
+     and chat_id not in (select telegram_chat_id from endpoints where telegram_chat_id is not null)
+     order by updated_at desc limit 5`,
+  ).bind(since).all()).results;
+  const sl = (await env.DB.prepare(
+    `select id, team, channel from slack_hooks where created_at > ?
+     and url not in (select slack_webhook_url from endpoints where slack_webhook_url is not null)
+     order by created_at desc limit 5`,
+  ).bind(since).all()).results;
+  const dests = [
+    ...tg.map((t) => ({ d: `tg:${t.chat_id}`, label: `Telegram group "${t.title || t.chat_id}"` })),
+    ...sl.map((s) => ({ d: `sl:${s.id}`, label: `Slack ${s.channel || 'channel'} in ${s.team || 'their workspace'}` })),
+  ];
+  if (!dests.length) {
+    return ['When they add @cronus_alerts_bot or connect Slack, that email will have the link to activate them.'];
+  }
+  if (!env.ADMIN_LINK_SECRET) return NO_LINKS;
+  const lines = ['Already connected and not yet in use. If one of these is theirs, click to review and activate:', ''];
+  for (const c of clientIds) {
+    for (const x of dests) {
+      lines.push(`  ${c} -> ${x.label}`);
+      lines.push(`  ${await signLink(env, { a: 'assign', c, d: x.d, e: now + ASSIGN_TTL_MS })}`, '');
+    }
+  }
+  return lines;
+}
+
+// ---- the action page -------------------------------------------------------
+function page(title, bodyHtml, status = 200) {
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>${esc(title)}</title><style>
+body{font:16px/1.5 system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 16px;color:#1b1f24;background:#fff}
+h1{font-size:22px}table{border-collapse:collapse;width:100%;font-size:14px}td,th{border-bottom:1px solid #ddd;padding:6px 4px;text-align:left;vertical-align:top;word-break:break-all}
+.note{background:#fff8e1;border:1px solid #f0d58a;padding:10px 12px;border-radius:6px}button{font:inherit;padding:10px 18px;border-radius:6px;border:0;background:#1f6feb;color:#fff;cursor:pointer}
+button.stop{background:#c62828}code{background:#f3f4f6;padding:1px 5px;border-radius:4px}
+@media (prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}td,th{border-color:#30363d}.note{background:#2b2410;border-color:#6b5a1e}code{background:#21262d}}
+</style></head><body>${bodyHtml}</body></html>`;
+  return new Response(html, {
+    status,
+    headers: {
+      'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-robots-tag': 'noindex',
+      'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY',
+      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+    },
+  });
+}
+
+const ACTIONS = {
+  assign: { verb: 'Activate monitoring', where: 'client_id = ?', arg: (p) => p.c },
+  pause: { verb: 'Pause monitoring', where: "client_id = ? and status = 'active'", arg: (p) => p.c },
+  resume: { verb: 'Resume monitoring', where: "client_id = ? and status = 'paused'", arg: (p) => p.c },
+  pause_email: { verb: 'Pause monitoring', where: "lower(contact_email) = lower(?) and status = 'active'", arg: (p) => p.m },
+};
+
+function endpointTable(rows) {
+  return `<table><tr><th>Client</th><th>Endpoint</th><th>URL</th><th>Now</th></tr>${rows.map((r) =>
+    `<tr><td>${esc(r.client_id)}</td><td>${esc(r.endpoint_name)}</td><td>${esc(r.target_url)}</td><td>${esc(r.status)}</td></tr>`).join('')}</table>`;
+}
+
+async function handleAdminAct(request, env, now = Date.now()) {
+  if (!['GET', 'POST'].includes(request.method)) return json({ ok: false, error: 'method not allowed' }, 405);
+  if (!env.DB) return page('Not configured', '<h1>Not configured</h1><p>The database binding is missing.</p>', 503);
+  let token = new URL(request.url).searchParams.get('t');
+  if (request.method === 'POST') {
+    try { token = (await request.formData()).get('t'); } catch { token = null; }
+  }
+  const p = await readLink(env, token, now);
+  const act = p && ACTIONS[p.a];
+  if (!act) {
+    return page('Link expired', '<h1>This link has expired or isn\'t valid</h1><p>Activate links last 14 days. ' +
+      'The newest "connected" or "Endpoint list" email has a fresh one.</p>', 400);
+  }
+  const { results: rows } = await env.DB.prepare(
+    `select client_id, endpoint_name, target_url, status, agency, contact_email, source from endpoints where ${act.where}
+     order by client_id, endpoint_name`,
+  ).bind(act.arg(p)).all();
+  const dest = p.a === 'assign' ? await destInfo(env, p.d) : null;
+  if (p.a === 'assign' && !dest) {
+    return page('Chat unavailable', '<h1>That chat is no longer available</h1><p>The bot was removed from the group, ' +
+      'or the group changed its ID. The newest "Telegram connected" email has the current one.</p>', 409);
+  }
+  if (!rows.length) {
+    return page('Nothing to do', `<h1>Nothing to do</h1><p>No endpoints match this link any more${p.c ? ` for <code>${esc(p.c)}</code>` : ''}. ` +
+      'They may already be paused, or were removed.</p>');
+  }
+
+  const who = rows[0].contact_email ? ` from ${esc(rows[0].agency || '')} &lt;${esc(rows[0].contact_email)}&gt;` : '';
+  if (request.method === 'GET') {
+    const intro = {
+      assign: `<p>Send confirmed incidents for <code>${esc(p.c)}</code>${who} to <b>${esc(dest?.label)}</b>.</p>
+<div class="note">Check every URL below is safe to call every 5 minutes. A checkout, payment or form URL that
+creates a real order or lead when called must not be monitored. Ask for a health or read-only endpoint instead.</div>`,
+      pause: `<p>Stop checking these endpoints and stop their alerts. Nothing is deleted; you can resume later.</p>`,
+      resume: `<p>Start checking these endpoints again.</p>`,
+      pause_email: `<p>Stop checking every endpoint submitted from <b>${esc(p.m)}</b>. Nothing is deleted.</p>`,
+    }[p.a];
+    return page(act.verb, `<h1>${esc(act.verb)}?</h1>${intro}<p>${plural(rows.length, 'endpoint')}:</p>${endpointTable(rows)}
+<form method="post" action="/api/admin/act"><input type="hidden" name="t" value="${esc(token)}">
+<p><button${p.a.startsWith('pause') ? ' class="stop"' : ''}>${esc(act.verb)}</button></p></form>`);
+  }
+
+  // POST: do it.
+  let changed;
+  if (p.a === 'assign') {
+    const set = dest.tg ? 'telegram_chat_id = ?' : 'slack_webhook_url = ?';
+    changed = (await env.DB.prepare(
+      `update endpoints set ${set}, status = 'active', activated_at = coalesce(activated_at, ?), updated_at = ? where ${act.where}`,
+    ).bind(dest.tg ?? dest.sl, now, now, act.arg(p)).run()).meta.changes;
+  } else {
+    const to = p.a === 'resume' ? 'active' : 'paused';
+    changed = (await env.DB.prepare(`update endpoints set status = ?, updated_at = ? where ${act.where}`)
+      .bind(to, now, act.arg(p)).run()).meta.changes;
+  }
+  console.log('admin action', p.a, changed);
+
+  const clients = [...new Set(rows.map((r) => r.client_id))];
+  const later = [];
+  for (const c of clients) {
+    const flip = p.a === 'pause' || p.a === 'pause_email'
+      ? await signLink(env, { a: 'resume', c, e: now + PAUSE_TTL_MS })
+      : await signLink(env, { a: 'pause', c, e: now + PAUSE_TTL_MS });
+    later.push(`<li><code>${esc(c)}</code>: <a href="${esc(flip)}">${p.a.startsWith('pause') ? 'resume' : 'pause'} later</a></li>`);
+  }
+  const next = p.a === 'assign' || p.a === 'resume'
+    ? `<p>Sentinel picks ${changed === 1 ? 'it' : 'them'} up on its next run, within about 5 minutes.</p>
+<p><b>Next:</b> GitHub → Actions → Cronus Sentinel → Run workflow, tick <code>test_alert</code>, and type
+<code>${esc(clients[0])}</code> in <code>test_client</code>, so they see a TEST card.</p>`
+    : '<p>Sentinel stops checking them on its next run. Their history is kept.</p>';
+  return page('Done', `<h1>Done: ${plural(changed, 'endpoint')} ${p.a === 'assign' || p.a === 'resume' ? 'active' : 'paused'}</h1>
+${next}<p>Bookmark these if useful:</p><ul>${later.join('')}</ul>`);
+}
+
+// ---- read API for sentinel.py ---------------------------------------------
+async function handleSentinelEndpoints(request, env) {
+  if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
+  const auth = request.headers.get('authorization') || '';
+  if (!env.HEARTBEAT_READ_TOKEN || !safeEqual(auth, `Bearer ${env.HEARTBEAT_READ_TOKEN}`)) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
+  }
+  if (!env.DB) return json({ ok: false, error: 'not configured' }, 503);
+  const { results } = await env.DB.prepare(
+    `select * from endpoints where status = 'active' and (telegram_chat_id is not null or slack_webhook_url is not null)
+     order by client_id, endpoint_name`,
+  ).all();
+  const endpoints = results.map((r) => {
+    let extra = {};
+    try { extra = JSON.parse(r.config || '{}'); } catch { extra = {}; }
+    if (!extra || typeof extra !== 'object' || Array.isArray(extra)) extra = {};
+    for (const k of CORE_FIELDS) delete extra[k];
+    return {
+      ...extra,
+      client_id: r.client_id,
+      endpoint_name: r.endpoint_name,
+      target_url: r.target_url,
+      telegram_chat_id: r.telegram_chat_id || '',
+      ...(r.slack_webhook_url ? { slack_webhook_url: r.slack_webhook_url } : {}),
+    };
+  });
+  return json({ version: 1, endpoints });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === '/api/pilot') return handlePilot(request, env);
     if (url.pathname === '/api/endpoints') return handleEndpoints(request, env);
     if (url.pathname === '/api/stripe/webhook') return handleStripe(request, env);
+    if (url.pathname === '/api/telegram/webhook') return handleTelegram(request, env);
     if (url.pathname.startsWith('/api/hb/')) return handleHeartbeat(request, env, url.pathname);
+    if (url.pathname === '/api/admin/act') return handleAdminAct(request, env);
+    if (url.pathname === '/api/sentinel/endpoints') return handleSentinelEndpoints(request, env);
     if (url.pathname === '/api/slack/install' || url.pathname === '/api/slack/callback') {
       if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
       return handleSlack(url, env);
@@ -687,3 +1022,153 @@ export default {
     ctx.waitUntil(dailyCheck(env).then((r) => console.log('daily check', JSON.stringify(r))));
   },
 };
+
+// ---------------------------------------------------------------------------
+// Telegram: when a client adds @cronus_alerts_bot to their group, the group's chat ID
+// is saved to D1 (telegram_chats) and emailed to the Cronus inbox, ready to paste.
+//
+//   POST /api/telegram/webhook   Telegram calls this (set up once with setWebhook).
+//
+// Setup (Cloudflare → Workers & Pages → cronus-forms → Settings → Variables and Secrets):
+//   Secret TELEGRAM_ALERTS_BOT_TOKEN  the Cronus Alerts token (same value as the GitHub secret)
+//   Secret TELEGRAM_WEBHOOK_SECRET    any random string of A-Z a-z 0-9 _ - (up to 256 chars);
+//                                     the same value goes in setWebhook's secret_token
+// ---------------------------------------------------------------------------
+
+const TG_JOINED = new Set(['member', 'administrator']);
+const TG_GONE = new Set(['left', 'kicked']);
+
+const TG_WELCOME =
+  'Cronus Signals is connected to this group. Once your endpoints are set up, ' +
+  'confirmed incidents will post here, starting with a test alert so you know what one looks like.';
+
+function tgWho(u) {
+  if (!u) return null;
+  const name = oneLine([u.first_name, u.last_name].filter(Boolean).join(' '), 120);
+  return u.username ? `${name} (@${oneLine(u.username, 64)})` : name || null;
+}
+
+function tgEmail(subject, lines) {
+  return [
+    `From: Cronus connect <${FROM}>`,
+    `To: ${TO}`,
+    `Subject: ${encodeHeader(oneLine(subject, 200))}`,
+    `Message-ID: <${crypto.randomUUID()}@cronussignals.com>`,
+    `Date: ${new Date().toUTCString()}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=utf-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    lines.join('\r\n'),
+  ].join('\r\n');
+}
+
+const tgMail = (env, subject, lines) => env.MAILER.send(new EmailMessage(FROM, TO, tgEmail(subject, lines)));
+
+async function tgSend(env, chatId, text) {
+  if (!env.TELEGRAM_ALERTS_BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_ALERTS_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+  } catch (e) {
+    console.log('telegram welcome failed', String(e)); // not fatal: the ID is already saved and emailed
+  }
+}
+
+async function tgRecord(env, chat, status, by, now) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    `insert into telegram_chats (chat_id, title, type, status, added_by, first_seen, updated_at)
+     values (?, ?, ?, ?, ?, ?, ?)
+     on conflict (chat_id) do update set title = excluded.title, type = excluded.type,
+       status = excluded.status, added_by = coalesce(excluded.added_by, telegram_chats.added_by),
+       updated_at = excluded.updated_at`,
+  ).bind(String(chat.id), oneLine(chat.title, 200), oneLine(chat.type, 20), status, by, now, now).run();
+}
+
+async function handleTelegram(request, env, now = Date.now()) {
+  if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+  const got = request.headers.get('x-telegram-bot-api-secret-token') || '';
+  if (!env.TELEGRAM_WEBHOOK_SECRET || !safeEqual(got, env.TELEGRAM_WEBHOOK_SECRET)) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
+  }
+  let u;
+  try { u = await request.json(); } catch { return json({ ok: true }); }
+
+  try {
+    // The bot was added to, or removed from, a group.
+    const cm = u.my_chat_member;
+    if (cm && (cm.chat?.type === 'group' || cm.chat?.type === 'supergroup')) {
+      const was = cm.old_chat_member?.status;
+      const is = cm.new_chat_member?.status;
+      const by = tgWho(cm.from);
+      const title = oneLine(cm.chat.title, 200);
+      const id = String(cm.chat.id);
+
+      if (TG_JOINED.has(is) && !TG_JOINED.has(was)) {
+        await tgRecord(env, cm.chat, 'active', by, now);
+        const extra = await quietly('telegram links', () => pendingClientLines(env, `tg:${id}`, now), []);
+        await tgMail(env, `Telegram connected: ${title}`, [
+          'A Telegram group just added @cronus_alerts_bot.',
+          '',
+          `Group:     ${title}`,
+          `Chat ID:   ${id}`,
+          `Added by:  ${by ?? 'unknown'}`,
+          '',
+          ...extra,
+          '',
+          `(Clients still in ENDPOINTS_JSON instead: "telegram_chat_id": "${id}")`,
+        ]);
+        await tgSend(env, id, TG_WELCOME);
+      } else if (TG_GONE.has(is) && !TG_GONE.has(was)) {
+        await tgRecord(env, cm.chat, 'removed', null, now);
+        const using = await quietly('count chat use', async () => (await env.DB.prepare(
+          "select count(*) as n from endpoints where telegram_chat_id = ? and status = 'active'").bind(id).first())?.n ?? 0, 0);
+        await tgMail(env, `Telegram removed: ${title}`, [
+          '@cronus_alerts_bot was removed from a client group.',
+          '',
+          `Group:     ${title}`,
+          `Chat ID:   ${id}`,
+          `Removed by: ${by ?? 'unknown'}`,
+          '',
+          `Active endpoints alerting this chat: ${using}. Alerts to it will fail until they add the bot back.`,
+          'If they have left Cronus, pause them (the cancellation email has the link) or remove them from ENDPOINTS_JSON.',
+        ]);
+      }
+    }
+
+    // A group that upgrades to a supergroup gets a NEW chat ID, and the old one stops working.
+    const m = u.message;
+    if (m?.migrate_to_chat_id) {
+      const oldId = String(m.chat.id);
+      const newId = String(m.migrate_to_chat_id);
+      const title = oneLine(m.chat.title, 200);
+      if (env.DB) {
+        await env.DB.prepare("update telegram_chats set status = 'migrated', updated_at = ? where chat_id = ?")
+          .bind(now, oldId).run();
+      }
+      await tgRecord(env, { id: newId, title, type: 'supergroup' }, 'active', null, now);
+      const moved = !env.DB ? 0 : (await env.DB.prepare('update endpoints set telegram_chat_id = ?, updated_at = ? where telegram_chat_id = ?')
+        .bind(newId, now, oldId).run()).meta.changes;
+      await tgMail(env, `Telegram chat ID changed: ${title}`, [
+        'A client group was upgraded by Telegram and its chat ID changed.',
+        `Updated ${plural(moved, 'endpoint')} in the database automatically.`,
+        'Any of theirs still in ENDPOINTS_JSON: update the ID there now, or alerts will fail.',
+        '',
+        `Group:   ${title}`,
+        `Old ID:  ${oldId}`,
+        `New ID:  ${newId}`,
+        '',
+        'Replace in their endpoints:',
+        `  "telegram_chat_id": "${newId}"`,
+      ]);
+    }
+  } catch (e) {
+    console.log('telegram update failed', String(e?.stack ?? e));
+    return json({ ok: false }, 500); // Telegram retries
+  }
+  return json({ ok: true });
+}

@@ -102,6 +102,9 @@ jobs:
           SEND_WEEKLY: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_report && '1' || '0' }}
           SEND_MONTHLY: ${{ github.event_name == 'workflow_dispatch' && inputs.monthly_report && '1' || '0' }}
           HEARTBEAT_READ_TOKEN: ${{ secrets.HEARTBEAT_READ_TOKEN }}   # same value as the cronus-forms Worker secret
+          # Client list kept in the cronus-forms database (activated from the inbox links). Monitored
+          # alongside ENDPOINTS_JSON; if it can't be reached, the last good copy is used.
+          ENDPOINTS_URL: https://cronussignals.com/api/sentinel/endpoints
           WEEKLY_DAY: "0"           # Monday
           WEEKLY_HOUR_UTC: "14"     # 9 AM Chicago in summer, 8 AM in winter
           CERT_WARN_DAYS: "14,3"    # certificate warnings this many days before expiry
