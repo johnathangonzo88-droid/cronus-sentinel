@@ -37,9 +37,13 @@ on:
         type: boolean
         default: true
       test_alert:
-        description: "Send one sample incident card to every alert channel, then stop (no checks). Always sends for real, even if dry_run is ticked."
+        description: "Send one sample incident card, then stop (no checks). Goes to the test_client below, or to EVERY client if that is blank. Always sends for real, even if dry_run is ticked."
         type: boolean
         default: false
+      test_client:
+        description: "With test_alert: the client_id to send the test card to (e.g. a new client). Leave blank to send to every client."
+        type: string
+        default: ""
       weekly_report:
         description: "Send this week's report to every client now, then stop (no checks). Counters are kept; the Monday report still goes out."
         type: boolean
@@ -93,6 +97,7 @@ jobs:
           # A test alert always really sends: it's harmless, and sending it is its whole point.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_alert && !inputs.monthly_report && '1' || '0' }}
           TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert && '1' || '0' }}
+          TEST_CLIENT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_client || '' }}
           SEND_WEEKLY: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_report && '1' || '0' }}
           SEND_MONTHLY: ${{ github.event_name == 'workflow_dispatch' && inputs.monthly_report && '1' || '0' }}
           HEARTBEAT_READ_TOKEN: ${{ secrets.HEARTBEAT_READ_TOKEN }}   # same value as the cronus-forms Worker secret

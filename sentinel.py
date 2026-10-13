@@ -85,6 +85,7 @@ VERBOSE = os.getenv("SENTINEL_VERBOSE_LOGS", "").lower() in {"1", "true", "yes"}
 IN_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
 TEST_ALERT = os.getenv("TEST_ALERT", "").lower() in {"1", "true", "yes"}
+TEST_CLIENT = os.getenv("TEST_CLIENT", "").strip()   # limit TEST_ALERT to one client_id (blank = everyone)
 SEND_WEEKLY = os.getenv("SEND_WEEKLY", "").lower() in {"1", "true", "yes"}   # preview now, keep counters
 WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "0"))              # 0 = Monday
 WEEKLY_HOUR_UTC = int(os.getenv("WEEKLY_HOUR_UTC", "14"))   # 14 UTC = 9 AM Chicago (summer)
@@ -1000,7 +1001,21 @@ def format_test(ep: Endpoint) -> str:
 
 
 async def send_test_alerts(endpoints: list[Endpoint]) -> int:
-    """One sample card per alert destination (Telegram chat / Slack webhook)."""
+    """One sample card per alert destination (Telegram chat / Slack webhook).
+
+    With TEST_CLIENT set, only that client's destinations get a card, so a new
+    client can be shown a test without every existing client receiving one too.
+    """
+    if TEST_CLIENT:
+        endpoints = [ep for ep in endpoints if ep.client_id.lower() == TEST_CLIENT.lower()]
+        if not endpoints:
+            # No client ids in the message: Actions logs on a public repo are public.
+            msg = "no endpoint has that test_client id; check the spelling against ENDPOINTS_JSON"
+            if IN_ACTIONS:
+                print(f"::error title=cronus-test-alert::{msg}")
+            else:
+                print(f"[test] {msg}", file=sys.stderr)
+            return 1
     seen: set[tuple[str, str]] = set()
     targets = []
     for ep in endpoints:
@@ -1012,7 +1027,8 @@ async def send_test_alerts(endpoints: list[Endpoint]) -> int:
         sent = await asyncio.gather(*(dispatch(session, Alert(ep, "test", format_test(ep)))
                                       for ep in targets))
     ok = sum(sent)
-    line = f"{ok}/{len(targets)} test alert(s) delivered" + (" (dry run)" if DRY_RUN else "")
+    line = (f"{ok}/{len(targets)} test alert(s) delivered"
+            + (" (one client)" if TEST_CLIENT else "") + (" (dry run)" if DRY_RUN else ""))
     if IN_ACTIONS:
         print(f"::notice title=cronus-test-alert::{line}")
         if ok < len(targets):

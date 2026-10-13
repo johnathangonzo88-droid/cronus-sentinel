@@ -154,6 +154,26 @@ async def main():
         assert t.returncode == 0 and "TEST ALERT" in t.stdout and "sample" in t.stdout, t.stdout + t.stderr
         assert "[test] 2/2 test alert(s) delivered" in t.stdout
         print("run 8: test alert shows a fully filled sample card ✓")
+
+        # test_client: only the named client's chat gets the card; an unknown id fails loudly.
+        two = {"endpoints": rich["endpoints"] + [
+            {"client_id": "other", "endpoint_name": "Other API", "target_url": f"{base}/ok",
+             "telegram_chat_id": "222"}]}
+        for who_, code, want, unwanted in (("ACME", 0, "2/2 test alert(s) delivered (one client)", "chat 222"),
+                                           ("other", 0, "1/1 test alert(s) delivered (one client)", "chat 1 "),
+                                           ("nobody", 1, None, "TEST ALERT")):
+            env = {**os.environ, "DRY_RUN": "1", "TEST_ALERT": "1", "TEST_CLIENT": who_,
+                   "SENTINEL_VERBOSE_LOGS": "1", "ENDPOINTS_JSON": json.dumps(two),
+                   "STATE_FILE": str(rich_tmp / "t2.json")}
+            t = subprocess.run([sys.executable, str(ROOT / "sentinel.py")], env=env,
+                               capture_output=True, text=True, timeout=60)
+            out = t.stdout + t.stderr
+            assert t.returncode == code, out
+            assert want is None or want in out, out
+            assert unwanted not in t.stdout, out
+            if code:
+                assert who_ not in out, out      # the error never echoes a client id into public logs
+        print("run 9: test_client sends only to the named client; unknown id fails ✓")
         print("\n--- sample rich incident card ---")
         print(edge_card.split("--- DRY RUN")[0])
         print("\n--- sample incident payload ---")
