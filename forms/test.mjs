@@ -2,7 +2,7 @@
 // Builds a test copy of worker.js (stubbing cloudflare:email), runs it against a real SQLite
 // database with the real schema, and signs Stripe events exactly the way Stripe does.
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -11,7 +11,7 @@ mkdirSync(`${here}.test`, { recursive: true });
 const src = readFileSync(`${here}worker.js`, 'utf8')
   .replace("import { EmailMessage } from 'cloudflare:email';",
     'class EmailMessage { constructor(from, to, raw) { this.from = from; this.to = to; this.raw = raw; } }')
-  + '\nexport const _test = { verifyStripe, claimEvent, dailyCheck, signLink, STALE_CLAIM_MS, NUDGE_AFTER_MS };\n';
+  + '\nexport const _test = { verifyStripe, claimEvent, dailyCheck, signLink, makeState, STALE_CLAIM_MS, NUDGE_AFTER_MS };\n';
 writeFileSync(`${here}.test/worker.mjs`, src);
 const { default: W, _test } = await import(`${here}.test/worker.mjs`);
 
@@ -488,6 +488,145 @@ await test('sentinel read API: token required; stored config cannot override cor
   assert.deepEqual(endpoints[0].json_rules, [{ path: 'ok', rule: 'exists' }]);
   delete env.HEARTBEAT_READ_TOKEN;
   assert.equal((await sentinelRead(env, 'readtok')).status, 401);
+});
+
+// ---- Slack: reconnects, uninstalls and dead webhooks --------------------------
+const realFetch = globalThis.fetch;
+let hookSeq = 0;
+const posted = [];
+// Stub Slack: oauth.v2.access hands out a fresh webhook for the channel asked for; webhook posts are recorded.
+async function slackConnect(env, { team = 'T1', channel = 'C1', user = 'U1', name = '#alerts' } = {}) {
+  const url = `https://hooks.slack.com/services/${team}/B${++hookSeq}/secret${hookSeq}`;
+  globalThis.fetch = async (u, init) => {
+    if (String(u) === 'https://slack.com/api/oauth.v2.access') {
+      return new Response(JSON.stringify({ ok: true, team: { id: team, name: 'Agency Co' }, authed_user: { id: user },
+        incoming_webhook: { url, channel: name, channel_id: channel } }));
+    }
+    posted.push({ u: String(u), body: init?.body });
+    return new Response('ok');
+  };
+  try {
+    const state = await _test.makeState(env.SLACK_CLIENT_SECRET);
+    const r = await W.fetch(new Request(`${BASE}/api/slack/callback?code=x&state=${encodeURIComponent(state)}`), env);
+    assert.equal(r.status, 302);
+    assert.match(r.headers.get('location'), /slack=connected/);
+  } finally { globalThis.fetch = realFetch; }
+  return url;
+}
+const slackSig = (body, ts, secret = 'signsecret') => `v0=${createHmac('sha256', secret).update(`v0:${ts}:${body}`).digest('hex')}`;
+function slackEvent(payload, { secret = 'signsecret', ts = Math.floor(Date.now() / 1000), sig } = {}) {
+  const body = JSON.stringify(payload);
+  return new Request(`${BASE}/api/slack/events`, { method: 'POST', body,
+    headers: { 'content-type': 'application/json', 'x-slack-request-timestamp': String(ts), 'x-slack-signature': sig ?? slackSig(body, ts, secret) } });
+}
+const uninstalled = (team = 'T1') => ({ type: 'event_callback', team_id: team, event: { type: 'app_uninstalled' } });
+const hooksOf = (env) => env.DB.sql.prepare('select * from slack_hooks order by id').all();
+const slackEnv = () => { const e = clientEnv(); e.env.SLACK_SIGNING_SECRET = 'signsecret'; return e; };
+async function activeOnSlack(env, sent) {
+  await W.fetch(endpointsForm('ana@agency.co'), env);
+  const url = await slackConnect(env);
+  await W.fetch(act(actLinks(sent.at(-1))[0], 'POST'), env);   // the "Slack connected" email's activate link
+  assert.equal(rowsOf(env)[0].slack_webhook_url, url);
+  assert.equal(rowsOf(env)[0].status, 'active');
+  return url;
+}
+
+await test('Slack connect stores workspace, channel and installer ids', async () => {
+  const { env, sent } = slackEnv();
+  await slackConnect(env, { team: 'T9', channel: 'C9', user: 'U9' });
+  const [h] = hooksOf(env);
+  assert.deepEqual([h.team_id, h.channel_id, h.installed_by, h.status], ['T9', 'C9', 'U9', 'active']);
+  assert.match(header(sent.at(-1), 'Subject'), /^Slack connected/);
+  assert.ok(posted.some((p) => p.u.includes('/T9/') && /connected to this channel/.test(p.body)));   // welcome post
+});
+
+await test('reconnecting the same Slack channel moves its endpoints to the new webhook', async () => {
+  const { env, sent } = slackEnv();
+  const old = await activeOnSlack(env, sent);
+  const other = await slackConnect(env, { channel: 'C2', name: '#other' });   // a different channel: untouched
+  assert.doesNotMatch(sent.at(-1), /Moved/);
+  const fresh = await slackConnect(env);
+  assert.notEqual(fresh, old);
+  assert.equal(rowsOf(env)[0].slack_webhook_url, fresh);
+  assert.match(sent.at(-1), /connected before\. Moved 1 endpoint/);
+  const byUrl = Object.fromEntries(hooksOf(env).map((h) => [h.url, h.status]));
+  assert.deepEqual([byUrl[old], byUrl[other], byUrl[fresh]], ['replaced', 'active', 'active']);
+});
+
+await test('Slack events: signature required; URL verification answers the challenge', async () => {
+  const { env, sent } = slackEnv();
+  assert.equal((await W.fetch(slackEvent(uninstalled(), { secret: 'wrong' }), env)).status, 401);
+  assert.equal((await W.fetch(slackEvent(uninstalled(), { ts: Math.floor(Date.now() / 1000) - 600 }), env)).status, 401);  // replay
+  assert.equal((await W.fetch(slackEvent(uninstalled(), { sig: '' }), env)).status, 401);
+  assert.equal((await W.fetch(new Request(`${BASE}/api/slack/events`), env)).status, 405);
+  const v = await W.fetch(slackEvent({ type: 'url_verification', challenge: 'abc123' }), env);
+  assert.equal(v.status, 200);
+  assert.equal(await v.text(), 'abc123');
+  delete env.SLACK_SIGNING_SECRET;                                  // not configured: closed
+  assert.equal((await W.fetch(slackEvent({ type: 'url_verification', challenge: 'x' }), env)).status, 401);
+  assert.equal(sent.length, 0);
+});
+
+await test('app uninstalled: one "Slack removed" email with affected clients; the channel can no longer be assigned', async () => {
+  const { env, sent } = slackEnv();
+  await activeOnSlack(env, sent);
+  const before = sent.length;
+  assert.equal((await W.fetch(slackEvent(uninstalled()), env)).status, 200);
+  assert.equal(sent.length, before + 1);
+  const mail = sent.at(-1);
+  assert.match(header(mail, 'Subject'), /^Slack removed: Agency Co #alerts/);
+  assert.match(mail, /Active endpoints alerting this channel: 1 \(agency-co--shop\)/);
+  assert.match(mail, /reconnect at cronussignals\.com\/connect/);
+  assert.equal(actLinks(mail).length, 1);                          // a pause link
+  assert.doesNotMatch(mail, /hooks\.slack\.com/);                  // never repeat the credential
+  assert.equal(hooksOf(env)[0].status, 'removed');
+  assert.equal((await W.fetch(slackEvent(uninstalled()), env)).status, 200);   // Slack retry: no second email
+  assert.equal(sent.length, before + 1);
+  assert.equal((await W.fetch(slackEvent(uninstalled('T_other')), env)).status, 200);  // another workspace: nothing
+  assert.equal(sent.length, before + 1);
+  const link = await _test.signLink(env, { a: 'assign', c: 'agency-co--shop', d: 'sl:1', e: Date.now() + 9e6 });
+  const r = await W.fetch(act(link), env);
+  assert.equal(r.status, 409);
+  assert.match(await r.text(), /Slack channel is no longer connected/);
+  await slackConnect(env);                                         // they reconnect: alerts flow again
+  assert.match(sent.at(-1), /Moved 1 endpoint/);
+  assert.equal(rowsOf(env)[0].slack_webhook_url, hooksOf(env).at(-1).url);
+});
+
+await test('tokens revoked: only the webhooks that person created are marked removed', async () => {
+  const { env, sent } = slackEnv();
+  await slackConnect(env, { channel: 'C1', user: 'U1' });
+  await slackConnect(env, { channel: 'C2', user: 'U2', name: '#ops' });
+  const before = sent.length;
+  await W.fetch(slackEvent({ type: 'event_callback', team_id: 'T1', event: { type: 'tokens_revoked', tokens: { oauth: ['U2'], bot: [] } } }), env);
+  assert.deepEqual(hooksOf(env).map((h) => h.status), ['active', 'removed']);
+  assert.equal(sent.length, before + 1);
+  assert.match(sent.at(-1), /No active endpoints use it/);
+  await W.fetch(slackEvent({ type: 'event_callback', team_id: 'T1', event: { type: 'tokens_revoked', tokens: { bot: ['B1'] } } }), env);
+  assert.equal(sent.length, before + 1);                           // bot tokens only: no webhooks affected
+});
+
+await test('sentinel reports a dead Slack webhook: emailed once, then reconnect fixes it', async () => {
+  const { env, sent } = slackEnv();
+  const url = await activeOnSlack(env, sent);
+  const report = (body, tok = 'readtok') => W.fetch(new Request(`${BASE}/api/sentinel/slack-dead`, { method: 'POST',
+    headers: { 'content-type': 'application/json', ...(tok ? { authorization: `Bearer ${tok}` } : {}) }, body: JSON.stringify(body) }), env);
+  const hash = createHash('sha256').update(url).digest('hex');
+  assert.equal((await report({ hook_sha256: hash }, 'wrong')).status, 401);
+  assert.equal((await report({ hook_sha256: hash }, null)).status, 401);
+  assert.equal((await report({ hook_sha256: 'nope' })).status, 400);
+  assert.deepEqual(await (await report({ hook_sha256: 'a'.repeat(64), reason: 'no_service' })).json(), { ok: true, known: false });
+  const before = sent.length;
+  assert.deepEqual(await (await report({ hook_sha256: hash, reason: '404 no_service <script>' })).json(), { ok: true, known: true, reported: true });
+  assert.equal(sent.length, before + 1);
+  assert.match(header(sent.at(-1), 'Subject'), /^Slack alerts failing: Agency Co #alerts/);
+  assert.match(sent.at(-1), /Reason:    404 no_service script/);
+  assert.equal(hooksOf(env)[0].status, 'dead');
+  assert.equal(hooksOf(env)[0].status_reason, '404 no_service script');
+  assert.equal((await (await report({ hook_sha256: hash, reason: 'no_service' })).json()).known, false);  // every later run: quiet
+  assert.equal(sent.length, before + 1);
+  await slackConnect(env);
+  assert.equal(rowsOf(env)[0].slack_webhook_url, hooksOf(env).at(-1).url);
 });
 
 console.log(`\nall ${n} checks passed`);

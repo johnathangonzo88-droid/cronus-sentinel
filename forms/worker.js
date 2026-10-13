@@ -5,6 +5,9 @@
 //   GET  /api/slack/install   "Add to Slack": sends the client to Slack to pick a channel.
 //   GET  /api/slack/callback  Slack sends them back here; the channel's webhook URL is
 //                             emailed to the Cronus inbox and a welcome line is posted.
+//                             Reconnecting the same channel moves its endpoints to the new URL.
+//   POST /api/slack/events    Slack: Cronus was uninstalled / access revoked (emails the inbox).
+//   POST /api/sentinel/slack-dead  sentinel.py: Slack refused an alert for good (emails the inbox).
 //   POST /api/stripe/webhook  Stripe events: new paying client, failed payment, cancellation,
 //                             each emailed to the Cronus inbox with what to do next.
 //   GET|POST|HEAD /api/hb/<id>
@@ -31,6 +34,7 @@
 //   Secret   HEARTBEAT_READ_TOKEN   (secret)      any long random string; the same value goes in the
 //                                                 cronus-sentinel GitHub secret of that name
 //   Secret   ADMIN_LINK_SECRET      (secret)      any long random string; signs the one-click links
+//   Secret   SLACK_SIGNING_SECRET   (secret)      Slack app → Basic Information → Signing Secret
 //
 // Spam handling: a hidden honeypot field, a minimum fill time, length limits and URL checks.
 
@@ -376,14 +380,42 @@ async function handleSlack(url, env) {
   hook.channel = oneLine(hook.channel ?? '', 120);
   hook.channel_id = oneLine(hook.channel_id ?? '', 40);
 
+  const installedBy = oneLine(data.authed_user?.id ?? '', 40) || null;
+  const now = Date.now();
+
   const hookId = await quietly('save slack hook', async () => {
     await env.DB.prepare(
-      `insert into slack_hooks (team, channel, url, created_at) values (?, ?, ?, ?)
-       on conflict (url) do update set team = excluded.team, channel = excluded.channel, created_at = excluded.created_at`,
-    ).bind(team.name, hook.channel, hook.url, Date.now()).run();
+      `insert into slack_hooks (team, team_id, channel, channel_id, installed_by, url, status, created_at)
+       values (?, ?, ?, ?, ?, ?, 'active', ?)
+       on conflict (url) do update set team = excluded.team, team_id = excluded.team_id, channel = excluded.channel,
+         channel_id = excluded.channel_id, installed_by = excluded.installed_by, status = 'active',
+         removed_at = null, status_reason = null, created_at = excluded.created_at`,
+    ).bind(team.name, team.id || null, hook.channel, hook.channel_id || null, installedBy, hook.url, now).run();
     return (await env.DB.prepare('select id from slack_hooks where url = ?').bind(hook.url).first())?.id ?? null;
   }, null);
-  const extra = hookId == null ? [] : await quietly('slack links', () => pendingClientLines(env, `sl:${hookId}`), []);
+
+  // Reconnecting a channel creates a new webhook URL. Move that channel's endpoints onto it,
+  // the way a Telegram supergroup upgrade moves them to the new chat id.
+  const moved = !(team.id && hook.channel_id) ? null : await quietly('move slack endpoints', async () => {
+    const { results: old } = await env.DB.prepare(
+      `select id, url, status from slack_hooks where team_id = ? and channel_id = ? and url <> ?`,
+    ).bind(team.id, hook.channel_id, hook.url).all();
+    let n = 0;
+    for (const o of old) {
+      n += (await env.DB.prepare('update endpoints set slack_webhook_url = ?, updated_at = ? where slack_webhook_url = ?')
+        .bind(hook.url, now, o.url).run()).meta.changes;
+      await env.DB.prepare("update slack_hooks set status = 'replaced', removed_at = coalesce(removed_at, ?), status_reason = 'reconnected' where id = ?")
+        .bind(now, o.id).run();
+    }
+    return { hooks: old.length, endpoints: n };
+  }, null);
+
+  const extra = [];
+  if (moved?.hooks) {
+    extra.push(`This channel was connected before. Moved ${plural(moved.endpoints, 'endpoint')} from the old connection to this one automatically.`,
+      'Anything of theirs still in ENDPOINTS_JSON: replace their old slack_webhook_url with the URL above.', '');
+  }
+  if (hookId != null) extra.push(...await quietly('slack links', () => pendingClientLines(env, `sl:${hookId}`), []));
 
   // The webhook is only useful if it reaches the inbox: no email, no success page.
   try {
@@ -398,6 +430,152 @@ async function handleSlack(url, env) {
     console.log('welcome post failed', String(e)); // not fatal: the URL is already in the inbox
   }
   return back({ slack: 'connected', channel: hook.channel, team: team.name });
+}
+
+// ---------------------------------------------------------------------------
+// Slack: knowing when a connection stops working.
+//
+//   POST /api/slack/events        Slack Events API (app_uninstalled, tokens_revoked).
+//                                 Setup: Secret SLACK_SIGNING_SECRET (Slack app → Basic
+//                                 Information → Signing Secret), then Event Subscriptions →
+//                                 Request URL https://cronussignals.com/api/slack/events,
+//                                 bot events app_uninstalled and tokens_revoked.
+//   POST /api/sentinel/slack-dead sentinel.py reports a webhook Slack refused for good
+//                                 (Bearer HEARTBEAT_READ_TOKEN; body {hook_sha256, reason}).
+//
+// Either way the hook is marked removed/dead and one email goes to the inbox, saying whose
+// alerts are affected, with pause links. A later "Add to Slack" for the same channel moves
+// the endpoints onto the new webhook automatically (see handleSlack).
+// ---------------------------------------------------------------------------
+const SLACK_TOLERANCE_S = 300;
+
+// Slack signs `v0:${timestamp}:${raw body}` with the app's signing secret.
+async function verifySlack(raw, ts, sig, secret, nowS = Math.floor(Date.now() / 1000)) {
+  if (!secret || !ts || !sig) return false;
+  const t = Number(ts);
+  if (!Number.isFinite(t) || Math.abs(nowS - t) > SLACK_TOLERANCE_S) return false;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const want = `v0=${hex(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`v0:${ts}:${raw}`)))}`;
+  return safeEqual(sig, want);
+}
+
+const sha256Hex = async (s) => hex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+
+const SLACK_LOST = {
+  app_uninstalled: { status: 'removed', subject: 'Slack removed', what: 'Cronus was uninstalled from their Slack workspace.' },
+  tokens_revoked: { status: 'removed', subject: 'Slack removed', what: 'The person who connected Cronus to Slack lost access (revoked, left the workspace or was deactivated), so their webhook stops working.' },
+  dead: { status: 'dead', subject: 'Slack alerts failing', what: 'Slack refused an alert for this channel, and that error does not fix itself.' },
+};
+
+// Mark these hooks lost and email the inbox once. rows: active slack_hooks rows.
+async function slackLost(env, rows, kind, reason, now = Date.now()) {
+  if (!rows.length) return 0;
+  const k = SLACK_LOST[kind];
+  const urls = rows.map((r) => r.url);
+  const marks = urls.map(() => '?').join(',');
+  const { results: eps } = await env.DB.prepare(
+    `select client_id, count(*) as n from endpoints where status = 'active' and slack_webhook_url in (${marks})
+     group by client_id order by client_id`,
+  ).bind(...urls).all();
+  const total = eps.reduce((a, r) => a + r.n, 0);
+  const pause = [];
+  if (eps.length && env.ADMIN_LINK_SECRET) {
+    pause.push('If they have left Cronus, pause them (review first, one click):');
+    for (const r of eps) pause.push(`  ${r.client_id}`, `  ${await signLink(env, { a: 'pause', c: r.client_id, e: now + PAUSE_TTL_MS })}`);
+  } else if (eps.length) {
+    pause.push(...NO_LINKS);
+  }
+  const team = rows[0].team || 'their workspace';
+  await tgMail(env, `${k.subject}: ${team} ${rows.map((r) => r.channel).filter(Boolean).join(', ')}`, [
+    k.what,
+    '',
+    `Workspace: ${team}${rows[0].team_id ? ` (${rows[0].team_id})` : ''}`,
+    `Channel:   ${rows.map((r) => r.channel || '?').join(', ')}`,
+    reason ? `Reason:    ${reason}` : '',
+    '',
+    `Active endpoints alerting ${rows.length === 1 ? 'this channel' : 'these channels'}: ${total}${eps.length ? ` (${eps.map((r) => r.client_id).join(', ')})` : ''}.`,
+    total ? 'Their incidents are NOT reaching them on Slack until this is fixed.' : 'No active endpoints use it, so nothing is being missed.',
+    '',
+    ...(total ? [
+      'To fix: ask them to reconnect at cronussignals.com/connect and pick the same channel.',
+      'The new connection moves their endpoints over automatically; you will get a "Slack connected" email.',
+      '',
+      ...pause,
+      '',
+    ] : []),
+    '(Anything of theirs still in ENDPOINTS_JSON needs its slack_webhook_url updated by hand.)',
+  ].filter((l, i, a) => l !== '' || a[i - 1] !== ''));
+  const ids = rows.map((r) => r.id);
+  await env.DB.prepare(
+    `update slack_hooks set status = ?, removed_at = ?, status_reason = ? where status = 'active' and id in (${ids.map(() => '?').join(',')})`,
+  ).bind(k.status, now, oneLine(reason || kind, 80), ...ids).run();
+  return rows.length;
+}
+
+async function handleSlackEvents(request, env, now = Date.now()) {
+  if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+  const raw = await request.text();
+  const ok = await verifySlack(raw, request.headers.get('x-slack-request-timestamp'),
+    request.headers.get('x-slack-signature'), env.SLACK_SIGNING_SECRET, Math.floor(now / 1000));
+  if (!ok) return json({ ok: false, error: 'unauthorized' }, 401);
+  let p;
+  try { p = JSON.parse(raw); } catch { return json({ ok: false, error: 'bad payload' }, 400); }
+
+  if (p.type === 'url_verification') {   // Slack checks the Request URL once, when it's saved
+    return new Response(String(p.challenge ?? ''), { headers: { 'content-type': 'text/plain' } });
+  }
+  if (p.type !== 'event_callback') return json({ ok: true });
+  const type = p.event?.type;
+  if (type !== 'app_uninstalled' && type !== 'tokens_revoked') return json({ ok: true, ignored: type ?? null });
+  if (!env.DB) return json({ ok: false, error: 'not configured' }, 503);   // Slack retries
+
+  const teamId = oneLine(p.team_id ?? '', 40);
+  try {
+    let rows = [];
+    if (type === 'app_uninstalled') {
+      rows = (await env.DB.prepare("select * from slack_hooks where team_id = ? and status = 'active' order by id")
+        .bind(teamId).all()).results;
+    } else {
+      // Only the webhooks created by the people whose access was revoked stop working.
+      const users = (Array.isArray(p.event?.tokens?.oauth) ? p.event.tokens.oauth : []).map((u) => oneLine(u, 40)).slice(0, 50);
+      if (users.length) {
+        rows = (await env.DB.prepare(
+          `select * from slack_hooks where team_id = ? and status = 'active' and installed_by in (${users.map(() => '?').join(',')}) order by id`,
+        ).bind(teamId, ...users).all()).results;
+      }
+    }
+    await slackLost(env, rows, type, type, now);
+  } catch (e) {
+    console.log('slack event failed', type, String(e?.stack ?? e));
+    return json({ ok: false }, 500);   // Slack retries; nothing was marked, so the retry redoes it
+  }
+  return json({ ok: true });
+}
+
+async function handleSlackDead(request, env, now = Date.now()) {
+  if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+  const auth = request.headers.get('authorization') || '';
+  if (!env.HEARTBEAT_READ_TOKEN || !safeEqual(auth, `Bearer ${env.HEARTBEAT_READ_TOKEN}`)) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
+  }
+  if (!env.DB) return json({ ok: false, error: 'not configured' }, 503);
+  let d;
+  try { d = await request.json(); } catch { return json({ ok: false, error: 'bad request' }, 400); }
+  const want = String(d?.hook_sha256 ?? '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(want)) return json({ ok: false, error: 'bad request' }, 400);
+  const reason = oneLine(d?.reason, 80).replace(/[^\w .:/()-]/g, '') || 'refused by Slack';
+
+  const { results } = await env.DB.prepare("select * from slack_hooks where status = 'active'").all();
+  let row = null;
+  for (const r of results) if (await sha256Hex(r.url) === want) { row = r; break; }
+  if (!row) return json({ ok: true, known: false });   // already reported, or a hook only in ENDPOINTS_JSON
+  try {
+    await slackLost(env, [row], 'dead', reason, now);
+  } catch (e) {
+    console.log('slack dead report failed', String(e?.stack ?? e));
+    return json({ ok: false }, 500);
+  }
+  return json({ ok: true, known: true, reported: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -807,8 +985,8 @@ async function destInfo(env, d) {
     return { label: `Telegram group "${row.title || row.chat_id}"`, tg: row.chat_id };
   }
   if (kind === 'sl') {
-    const row = await env.DB.prepare('select id, team, channel, url from slack_hooks where id = ?').bind(Number(id)).first();
-    if (!row) return null;
+    const row = await env.DB.prepare('select id, team, channel, url, status from slack_hooks where id = ?').bind(Number(id)).first();
+    if (!row || row.status !== 'active') return null;
     return { label: `Slack ${row.channel || 'channel'} in ${row.team || 'their workspace'}`, sl: row.url };
   }
   return null;
@@ -844,7 +1022,7 @@ async function openDestinationLines(env, clientIds, now = Date.now()) {
      order by updated_at desc limit 5`,
   ).bind(since).all()).results;
   const sl = (await env.DB.prepare(
-    `select id, team, channel from slack_hooks where created_at > ?
+    `select id, team, channel from slack_hooks where status = 'active' and created_at > ?
      and url not in (select slack_webhook_url from endpoints where slack_webhook_url is not null)
      order by created_at desc limit 5`,
   ).bind(since).all()).results;
@@ -918,8 +1096,11 @@ async function handleAdminAct(request, env, now = Date.now()) {
   ).bind(act.arg(p)).all();
   const dest = p.a === 'assign' ? await destInfo(env, p.d) : null;
   if (p.a === 'assign' && !dest) {
-    return page('Chat unavailable', '<h1>That chat is no longer available</h1><p>The bot was removed from the group, ' +
-      'or the group changed its ID. The newest "Telegram connected" email has the current one.</p>', 409);
+    return page('Chat unavailable', String(p.d).startsWith('sl:')
+      ? '<h1>That Slack channel is no longer connected</h1><p>Cronus was removed from their workspace, the channel stopped ' +
+        'accepting posts, or they reconnected it. The newest "Slack connected" email has the current one.</p>'
+      : '<h1>That chat is no longer available</h1><p>The bot was removed from the group, ' +
+        'or the group changed its ID. The newest "Telegram connected" email has the current one.</p>', 409);
   }
   if (!rows.length) {
     return page('Nothing to do', `<h1>Nothing to do</h1><p>No endpoints match this link any more${p.c ? ` for <code>${esc(p.c)}</code>` : ''}. ` +
@@ -1011,6 +1192,8 @@ export default {
     if (url.pathname.startsWith('/api/hb/')) return handleHeartbeat(request, env, url.pathname);
     if (url.pathname === '/api/admin/act') return handleAdminAct(request, env);
     if (url.pathname === '/api/sentinel/endpoints') return handleSentinelEndpoints(request, env);
+    if (url.pathname === '/api/sentinel/slack-dead') return handleSlackDead(request, env);
+    if (url.pathname === '/api/slack/events') return handleSlackEvents(request, env);
     if (url.pathname === '/api/slack/install' || url.pathname === '/api/slack/callback') {
       if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
       return handleSlack(url, env);

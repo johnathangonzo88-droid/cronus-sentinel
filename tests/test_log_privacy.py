@@ -114,8 +114,73 @@ def test_telegram_error_body_redacted() -> None:
     print("telegram errors: no chat ids unless verbose ✓")
 
 
+SLACK_SECRET_PATH = "/services/T0SECRET/B0SECRET/xoxSECRETtoken"
+slack_seen: dict = {"dead": [], "posts": 0}
+
+
+async def slack_hook(req):
+    slack_seen["posts"] += 1
+    kind = req.match_info["kind"]
+    if kind == "gone":
+        return web.Response(text="no_service", status=404)
+    if kind == "busy" and slack_seen["posts"] == 1:
+        return web.Response(text="rate_limited", status=429, headers={"Retry-After": "1"})
+    if kind == "bad":
+        return web.Response(text="invalid_payload", status=400)
+    return web.Response(text="ok")
+
+
+async def slack_dead(req):
+    assert req.headers.get("authorization") == "Bearer tok"
+    slack_seen["dead"].append(await req.json())
+    return web.json_response({"ok": True, "known": True})
+
+
+async def check_slack_errors() -> tuple[str, list]:
+    import hashlib
+    import io
+    import contextlib
+    for k in ("DRY_RUN", "TEST_CLIENT"):
+        os.environ.pop(k, None)
+    os.environ["SENTINEL_VERBOSE_LOGS"] = "0"
+    sys.modules.pop("sentinel", None)
+    import sentinel as S
+    S.HEARTBEAT_READ_TOKEN = "tok"
+    S.SLACK_DEAD_URL = f"http://127.0.0.1:{PORT}/slack-dead"
+    app = web.Application()
+    app.router.add_post("/hook/{kind}" + SLACK_SECRET_PATH, slack_hook)
+    app.router.add_post("/slack-dead", slack_dead)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "127.0.0.1", PORT).start()
+    url = lambda kind: f"http://127.0.0.1:{PORT}/hook/{kind}{SLACK_SECRET_PATH}"  # noqa: E731
+    buf = io.StringIO()
+    try:
+        ep = S.Endpoint(client_id="c", endpoint_name="e", target_url="https://example.com", telegram_chat_id="")
+        async with S.aiohttp.ClientSession() as session:
+            with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+                assert await S.send_slack(session, url("busy"), S.Alert(ep, "test", "hi")) is True  # 429, then ok
+                slack_seen["posts"] = 0
+                assert await S.send_slack(session, url("gone"), S.Alert(ep, "test", "hi")) is False
+                assert await S.send_slack(session, url("gone"), S.Alert(ep, "test", "hi")) is False
+                assert await S.send_slack(session, url("bad"), S.Alert(ep, "test", "hi")) is False
+    finally:
+        await runner.cleanup()
+    assert slack_seen["dead"] == [{"hook_sha256": hashlib.sha256(url("gone").encode()).hexdigest(),
+                                   "reason": "404 no_service"}], slack_seen["dead"]   # once per run; 400 not reported
+    return buf.getvalue(), slack_seen["dead"]
+
+
+def test_slack_errors_reported_without_the_url() -> None:
+    out, _ = asyncio.run(check_slack_errors())
+    assert "Slack 404: no_service" in out and "Slack 400: invalid_payload" in out, out
+    assert "SECRET" not in out, out
+    print("slack errors: code logged, dead webhook reported once by hash, URL never printed ✓")
+
+
 if __name__ == "__main__":
     test_test_client_from_event_payload()
     test_workflow_does_not_pass_test_client_in_env()
     test_telegram_error_body_redacted()
+    test_slack_errors_reported_without_the_url()
     print("\nall log-privacy tests passed")
