@@ -60,9 +60,11 @@ with a challenge page instead of their app, so Cronus can't see its health. Fixe
 
 ## 5. Send the test alert (the client watches it arrive)
 
-Actions → Cronus Sentinel → **Run workflow** → untick `dry_run`, tick `test_alert` → Run.
-Every alert channel gets one sample card marked TEST. The run's annotation says
-`N/N test alert(s) delivered`. If anything failed, stop and fix it before go-live.
+Actions → Cronus Sentinel → **Run workflow** → tick `test_alert`, type the new client's
+`client_id` in `test_client` → Run. Only that client's channel(s) get one sample card marked
+TEST; existing clients get nothing. (Leave `test_client` blank to send to every client,
+e.g. after rotating the bot token.) The run's annotation says
+`N/N test alert(s) delivered (one client)`. If anything failed, stop and fix it before go-live.
 
 ## 6. Tell the client, in writing
 
