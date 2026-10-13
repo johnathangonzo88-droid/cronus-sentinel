@@ -16,8 +16,7 @@
         "type": "object",
         "required": [
           "client_id",
-          "endpoint_name",
-          "telegram_chat_id"
+          "endpoint_name"
         ],
         "additionalProperties": false,
         "properties": {
@@ -229,18 +228,28 @@
             "client_id",
             "endpoint_name",
             "heartbeat_id",
-            "expect_every_min",
-            "telegram_chat_id"
+            "expect_every_min"
           ]
         },
         "else": {
           "required": [
             "client_id",
             "endpoint_name",
-            "target_url",
-            "telegram_chat_id"
+            "target_url"
           ]
-        }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "telegram_chat_id"
+            ]
+          },
+          {
+            "required": [
+              "slack_webhook_url"
+            ]
+          }
+        ]
       }
     }
   }

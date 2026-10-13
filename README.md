@@ -33,12 +33,19 @@ tests/smoke_test.py             # offline test against a local fake server
 
 ## Adding a client
 
-Tell Jarvis ("add Acme as a pilot…"); it keeps the client list and writes the
-file with `ops_export_endpoints`. Paste the whole file into the
-`ENDPOINTS_JSON` secret. Required per endpoint: `client_id`, `endpoint_name`,
-`target_url`, `telegram_chat_id`. Optional: `method`, `timeout_ms`,
-`failure_threshold`, `expected_status`, `slack_webhook_url`, `enabled`, plus the content
-checks, heartbeat and report fields below. `endpoints.schema.json` documents every field.
+Clients normally add themselves: the pilot and endpoint-list forms save their endpoints in
+the cronus-forms database as pending, and you activate them with the one-click link in the
+"Telegram connected" / "Slack connected" email. Sentinel reads the active ones every run
+from `ENDPOINTS_URL` (`GET /api/sentinel/endpoints`, authorised with `HEARTBEAT_READ_TOKEN`)
+and keeps the last good copy in its state file in case the Worker can't be reached.
+ONBOARDING.md has the steps.
+
+The `ENDPOINTS_JSON` secret still works and is monitored alongside the database list.
+Required per endpoint: `client_id`, `endpoint_name`, `target_url`, and a
+`telegram_chat_id` or `slack_webhook_url`. Optional: `method`, `timeout_ms`,
+`failure_threshold`, `expected_status`, `enabled`, plus the content checks, heartbeat and
+report fields below. `endpoints.schema.json` documents every field; for database clients
+the same fields go in the endpoint's `config` JSON.
 
 ### Content checks: "200 OK, but broken"
 

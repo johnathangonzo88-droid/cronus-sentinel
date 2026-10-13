@@ -1,53 +1,63 @@
 # Client onboarding checklist
 
-Ten minutes per client. Do every step, in order. Nothing is "live" until step 5 passes.
+A few minutes per client. Do every step, in order. Nothing is "live" until step 5 passes.
 
-## 1. Collect (one email or DM)
+## 1. They send their endpoints (no copying on your side)
 
-- [ ] Agency name and a short client id, lowercase with dashes (e.g. `northwind-agency`)
-- [ ] Up to 3 URLs for a pilot, 25 for Pro Agency. For each: a human name ("Orders webhook receiver"), the URL, and the expected healthy status if it isn't a normal 2xx/3xx (e.g. a webhook receiver that answers `405` to GET)
-- [ ] Where alerts go: a Telegram group (preferred) or a Slack incoming-webhook URL
-- [ ] Pilot start date (today) → write down day 12 (check-in) and day 14 (pilot ends)
+- **Pilot:** the pilot form on cronussignals.com (up to 3 URLs). Saved as client
+  `agency-name--pilot`.
+- **Pro Agency:** cronussignals.com/endpoints after paying (up to 25). Saved as
+  `agency-name--client-name` per client site.
 
-## 2. Get their Telegram chat id
+Either way the endpoints are stored in the cronus-forms database as **pending**: nothing is
+checked yet. You get the usual email listing them. Write down the pilot start date (day 12
+check-in, day 14 end).
 
-1. They add the Cronus bot to their alert group and post any message in it.
-2. You find the group id (starts with `-100`): forward that message to `@RawDataBot`,
-   or open the bot's `getUpdates` page in your own browser. Never paste the bot token
-   into chat tools, docs or this repo.
+## 2. They connect alerts, you activate
 
-## 3. Update the endpoint list
+They add **@cronus_alerts_bot** to a Telegram group, or click *Add to Slack* on
+cronussignals.com/connect. You get a "Telegram connected" or "Slack connected" email with
+one link per client still waiting:
 
-The live list is the `ENDPOINTS_JSON` secret (GitHub → cronus-sentinel → Settings →
-Secrets and variables → Actions). Updating it **replaces the whole list**, so:
+```
+Whose alerts should go here? Click to review, then activate:
+  bright-pixel--pilot  (3 endpoints, Bright Pixel, bo@brightpixel.co)
+  https://cronussignals.com/api/admin/act?t=...
+```
 
-1. Edit your private master copy (keep it outside this public repo).
-2. Add one entry per URL:
+(If they connected first and sent the list after, the link is in the endpoint-list email
+instead.) Click it. The page shows every URL and where alerts will go; nothing changes until
+you press **Activate monitoring**.
 
-   ```json
-   {
-     "client_id": "northwind-agency",
-     "endpoint_name": "Orders webhook receiver",
-     "target_url": "https://example.com/webhooks/orders",
-     "telegram_chat_id": "-1001234567890",
-     "expected_status": [200, 405]
-   }
-   ```
+Before you press it, check each URL is safe to call every 5 minutes. A checkout, payment or
+form URL that creates a real order or lead when called must not be monitored: ask for a
+health or read-only endpoint instead.
 
-   Optional fields: `method`, `timeout_ms` (default 3000), `failure_threshold`
-   (default 2), `slack_webhook_url`, `enabled`. See `endpoints.schema.json`.
+Links last 14 days. The forms can never change an endpoint that is already active, so a
+stranger can't redirect a client's monitoring.
 
-   Worth asking every client for (they make alerts far more useful):
-   - `timezone` — e.g. `"America/Chicago"`; alerts show their local time next to UTC.
-   - `severity` — e.g. `"critical"` for checkout or payment paths; shown in the alert header.
-   - `runbook_url` / `dashboard_url` — https links that become buttons on every alert
-     (their runbook doc, hosting dashboard, or log search).
-3. Check it's valid JSON (any JSON validator), then paste the full list into the secret.
+## 3. Optional: extra settings
+
+Activated endpoints use sensible defaults. To add `expected_status`, `timezone`,
+`severity`, `runbook_url`, `dashboard_url`, content checks or report branding, edit the
+endpoint's `config` JSON in Cloudflare → D1 → cronus-onboarding → Console, for example:
+
+```sql
+update endpoints set config = '{"expected_status":[200,405],"timezone":"America/Chicago","severity":"critical"}'
+where client_id = 'bright-pixel--pilot' and endpoint_name = 'shop.co/webhooks/orders';
+```
+
+Field names are the same as in `endpoints.schema.json`. Sentinel reads the change on its next run.
+
+Clients can still be listed in the `ENDPOINTS_JSON` secret instead (that's where
+`cronus-internal` lives). Both are monitored; if the same client_id + endpoint name is in
+both, the secret's copy wins.
 
 ## 4. Confirm the URLs are healthy now
 
-Actions → Cronus Sentinel → latest run → the `cronus-summary` line. `n` should equal
-the new endpoint count and `failing` should be `[]`. If a URL is failing on day one,
+Wait for the next run (within 5 minutes), then Actions → Cronus Sentinel → latest run.
+The `cronus-config` notice should count the new endpoints ("... + N from the client list"),
+and in the `cronus-summary` line `failing` should be `[]`. If a URL is failing on day one,
 fix the config (usually `expected_status`) before the client sees an alert.
 
 If `blocked` lists an endpoint, the client's bot protection (usually Cloudflare) answered
@@ -76,8 +86,10 @@ e.g. after rotating the bot token.) The run's annotation says
 
 - Day 12: run the workflow with **weekly_report** ticked (and `dry_run` unticked) so the client
   gets a fresh report in their channel, then send the payment link with a line pointing to it.
-- Day 14: paid → keep running. Not paid → remove their entries from `ENDPOINTS_JSON` the
-  same day and tell them it's off. Never keep monitoring a client who hasn't agreed to pay.
+- Day 14: paid → keep running. Not paid → pause them the same day and tell them it's off.
+  Never keep monitoring a client who hasn't agreed to pay. To pause: the **pause later** link
+  on the page you saw after activating, or the cancellation email's link for paid clients, or
+  in the D1 console: `update endpoints set status = 'paused' where client_id = '...';`
 
 ## Offboarding
 
