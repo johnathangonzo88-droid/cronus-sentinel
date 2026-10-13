@@ -675,6 +675,7 @@ export default {
     if (url.pathname === '/api/pilot') return handlePilot(request, env);
     if (url.pathname === '/api/endpoints') return handleEndpoints(request, env);
     if (url.pathname === '/api/stripe/webhook') return handleStripe(request, env);
+    if (url.pathname === '/api/telegram/webhook') return handleTelegram(request, env);
     if (url.pathname.startsWith('/api/hb/')) return handleHeartbeat(request, env, url.pathname);
     if (url.pathname === '/api/slack/install' || url.pathname === '/api/slack/callback') {
       if (request.method !== 'GET') return json({ ok: false, error: 'method not allowed' }, 405);
@@ -687,3 +688,148 @@ export default {
     ctx.waitUntil(dailyCheck(env).then((r) => console.log('daily check', JSON.stringify(r))));
   },
 };
+
+// ---------------------------------------------------------------------------
+// Telegram: when a client adds @cronus_alerts_bot to their group, the group's chat ID
+// is saved to D1 (telegram_chats) and emailed to the Cronus inbox, ready to paste.
+//
+//   POST /api/telegram/webhook   Telegram calls this (set up once with setWebhook).
+//
+// Setup (Cloudflare → Workers & Pages → cronus-forms → Settings → Variables and Secrets):
+//   Secret TELEGRAM_ALERTS_BOT_TOKEN  the Cronus Alerts token (same value as the GitHub secret)
+//   Secret TELEGRAM_WEBHOOK_SECRET    any random string of A-Z a-z 0-9 _ - (up to 256 chars);
+//                                     the same value goes in setWebhook's secret_token
+// ---------------------------------------------------------------------------
+
+const TG_JOINED = new Set(['member', 'administrator']);
+const TG_GONE = new Set(['left', 'kicked']);
+
+const TG_WELCOME =
+  'Cronus Signals is connected to this group. Once your endpoints are set up, ' +
+  'confirmed incidents will post here, starting with a test alert so you know what one looks like.';
+
+function tgWho(u) {
+  if (!u) return null;
+  const name = oneLine([u.first_name, u.last_name].filter(Boolean).join(' '), 120);
+  return u.username ? `${name} (@${oneLine(u.username, 64)})` : name || null;
+}
+
+function tgEmail(subject, lines) {
+  return [
+    `From: Cronus connect <${FROM}>`,
+    `To: ${TO}`,
+    `Subject: ${encodeHeader(oneLine(subject, 200))}`,
+    `Message-ID: <${crypto.randomUUID()}@cronussignals.com>`,
+    `Date: ${new Date().toUTCString()}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=utf-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    lines.join('\r\n'),
+  ].join('\r\n');
+}
+
+const tgMail = (env, subject, lines) => env.MAILER.send(new EmailMessage(FROM, TO, tgEmail(subject, lines)));
+
+async function tgSend(env, chatId, text) {
+  if (!env.TELEGRAM_ALERTS_BOT_TOKEN) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_ALERTS_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+  } catch (e) {
+    console.log('telegram welcome failed', String(e)); // not fatal: the ID is already saved and emailed
+  }
+}
+
+async function tgRecord(env, chat, status, by, now) {
+  if (!env.DB) return;
+  await env.DB.prepare(
+    `insert into telegram_chats (chat_id, title, type, status, added_by, first_seen, updated_at)
+     values (?, ?, ?, ?, ?, ?, ?)
+     on conflict (chat_id) do update set title = excluded.title, type = excluded.type,
+       status = excluded.status, added_by = coalesce(excluded.added_by, telegram_chats.added_by),
+       updated_at = excluded.updated_at`,
+  ).bind(String(chat.id), oneLine(chat.title, 200), oneLine(chat.type, 20), status, by, now, now).run();
+}
+
+async function handleTelegram(request, env, now = Date.now()) {
+  if (request.method !== 'POST') return json({ ok: false, error: 'method not allowed' }, 405);
+  const got = request.headers.get('x-telegram-bot-api-secret-token') || '';
+  if (!env.TELEGRAM_WEBHOOK_SECRET || !safeEqual(got, env.TELEGRAM_WEBHOOK_SECRET)) {
+    return json({ ok: false, error: 'unauthorized' }, 401);
+  }
+  let u;
+  try { u = await request.json(); } catch { return json({ ok: true }); }
+
+  try {
+    // The bot was added to, or removed from, a group.
+    const cm = u.my_chat_member;
+    if (cm && (cm.chat?.type === 'group' || cm.chat?.type === 'supergroup')) {
+      const was = cm.old_chat_member?.status;
+      const is = cm.new_chat_member?.status;
+      const by = tgWho(cm.from);
+      const title = oneLine(cm.chat.title, 200);
+      const id = String(cm.chat.id);
+
+      if (TG_JOINED.has(is) && !TG_JOINED.has(was)) {
+        await tgRecord(env, cm.chat, 'active', by, now);
+        await tgMail(env, `Telegram connected: ${title}`, [
+          'A Telegram group just added @cronus_alerts_bot.',
+          '',
+          `Group:     ${title}`,
+          `Chat ID:   ${id}`,
+          `Added by:  ${by ?? 'unknown'}`,
+          '',
+          'For each of their endpoints in ENDPOINTS_JSON:',
+          `  "telegram_chat_id": "${id}"`,
+          '',
+          'Then run the workflow with test_alert ticked so they see a TEST card in that group.',
+        ]);
+        await tgSend(env, id, TG_WELCOME);
+      } else if (TG_GONE.has(is) && !TG_GONE.has(was)) {
+        await tgRecord(env, cm.chat, 'removed', null, now);
+        await tgMail(env, `Telegram removed: ${title}`, [
+          '@cronus_alerts_bot was removed from a client group.',
+          '',
+          `Group:     ${title}`,
+          `Chat ID:   ${id}`,
+          `Removed by: ${by ?? 'unknown'}`,
+          '',
+          'Alerts to this chat ID will fail until they add the bot back.',
+          'If they have left Cronus, remove their endpoints from ENDPOINTS_JSON.',
+        ]);
+      }
+    }
+
+    // A group that upgrades to a supergroup gets a NEW chat ID, and the old one stops working.
+    const m = u.message;
+    if (m?.migrate_to_chat_id) {
+      const oldId = String(m.chat.id);
+      const newId = String(m.migrate_to_chat_id);
+      const title = oneLine(m.chat.title, 200);
+      if (env.DB) {
+        await env.DB.prepare("update telegram_chats set status = 'migrated', updated_at = ? where chat_id = ?")
+          .bind(now, oldId).run();
+      }
+      await tgRecord(env, { id: newId, title, type: 'supergroup' }, 'active', null, now);
+      await tgMail(env, `Telegram chat ID changed: ${title}`, [
+        'A client group was upgraded by Telegram and its chat ID changed.',
+        'Alerts to the old ID will fail, so update ENDPOINTS_JSON now.',
+        '',
+        `Group:   ${title}`,
+        `Old ID:  ${oldId}`,
+        `New ID:  ${newId}`,
+        '',
+        'Replace in their endpoints:',
+        `  "telegram_chat_id": "${newId}"`,
+      ]);
+    }
+  } catch (e) {
+    console.log('telegram update failed', String(e?.stack ?? e));
+    return json({ ok: false }, 500); // Telegram retries
+  }
+  return json({ ok: true });
+}

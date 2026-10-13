@@ -43,3 +43,14 @@ create table if not exists heartbeats (
   last_ping   integer,                    -- ms since epoch; null until the first check-in
   pings       integer not null default 0
 );
+
+-- Telegram groups that added @cronus_alerts_bot (written by the /api/telegram/webhook handler).
+create table if not exists telegram_chats (
+  chat_id     text primary key,
+  title       text,
+  type        text,                       -- group | supergroup
+  status      text not null,              -- active | removed | migrated
+  added_by    text,
+  first_seen  integer not null,           -- ms since epoch
+  updated_at  integer not null
+);
