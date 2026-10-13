@@ -85,7 +85,28 @@ VERBOSE = os.getenv("SENTINEL_VERBOSE_LOGS", "").lower() in {"1", "true", "yes"}
 IN_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "50"))
 TEST_ALERT = os.getenv("TEST_ALERT", "").lower() in {"1", "true", "yes"}
-TEST_CLIENT = os.getenv("TEST_CLIENT", "").strip()   # limit TEST_ALERT to one client_id (blank = everyone)
+
+
+def dispatch_input(name: str) -> str:
+    """A workflow_dispatch input, read from the event payload file.
+
+    Values passed through a step's env: block are printed, unmasked, at the top of
+    that step's log, and the logs of a public repo are public. Reading the input
+    from $GITHUB_EVENT_PATH instead keeps a client_id out of the log entirely.
+    """
+    if os.getenv("GITHUB_EVENT_NAME") != "workflow_dispatch":
+        return ""
+    try:
+        with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as fh:
+            value = (json.load(fh).get("inputs") or {}).get(name)
+    except (KeyError, OSError, ValueError, AttributeError):
+        return ""
+    return str(value or "").strip()
+
+
+# Limit TEST_ALERT to one client_id (blank = everyone). Locally it comes from the
+# environment; on GitHub, from the test_client input (see dispatch_input).
+TEST_CLIENT = os.getenv("TEST_CLIENT", "").strip() or dispatch_input("test_client")
 SEND_WEEKLY = os.getenv("SEND_WEEKLY", "").lower() in {"1", "true", "yes"}   # preview now, keep counters
 WEEKLY_DAY = int(os.getenv("WEEKLY_DAY", "0"))              # 0 = Monday
 WEEKLY_HOUR_UTC = int(os.getenv("WEEKLY_HOUR_UTC", "14"))   # 14 UTC = 9 AM Chicago (summer)
@@ -906,6 +927,19 @@ TELEGRAM_HINTS = {
 }
 
 
+def telegram_error_line(status: int, chat_id: str, body: str) -> str:
+    """Log line for a failed Telegram send; no chat ids unless VERBOSE."""
+    if VERBOSE:
+        return f"Telegram {status} for {chat_id}: {body[:300]}"
+    try:
+        why = str(json.loads(body).get("description", ""))
+    except (json.JSONDecodeError, AttributeError):
+        why = ""
+    # Telegram descriptions don't contain ids, but strip long numbers just in case.
+    why = re.sub(r"-?\d{6,}", "<id>", why)[:200]
+    return f"Telegram {status} for <chat hidden>: {why or '(no description)'}"
+
+
 async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Alert) -> bool:
     text = alert.text
     if len(text) > TELEGRAM_MAX:  # only a huge URL could do this; keep the card sendable
@@ -939,9 +973,9 @@ async def send_telegram(session: aiohttp.ClientSession, chat_id: str, alert: Ale
                     retry = (await resp.json(content_type=None)).get("parameters", {}).get("retry_after", 2)
                     await asyncio.sleep(min(float(retry), 10))
                     continue
-                # Never print the token; the body is safe to log.
-                where = chat_id if VERBOSE else "<chat hidden>"
-                print(f"[alert] Telegram {resp.status} for {where}: {body[:300]}", file=sys.stderr)
+                # Never print the token. The raw body can carry a chat id (a group upgraded
+                # to a supergroup returns migrate_to_chat_id), so only VERBOSE logs print it.
+                print(f"[alert] {telegram_error_line(resp.status, chat_id, body)}", file=sys.stderr)
                 if IN_ACTIONS:  # surface Telegram's reason on the run page (no chat id, no token)
                     try:
                         why = json.loads(body).get("description", "")

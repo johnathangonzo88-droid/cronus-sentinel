@@ -97,7 +97,8 @@ jobs:
           # A test alert always really sends: it's harmless, and sending it is its whole point.
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.test_alert && !inputs.monthly_report && '1' || '0' }}
           TEST_ALERT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_alert && '1' || '0' }}
-          TEST_CLIENT: ${{ github.event_name == 'workflow_dispatch' && inputs.test_client || '' }}
+          # test_client is NOT passed here: env values are printed in the public step log.
+          # sentinel.py reads it from the event payload instead.
           SEND_WEEKLY: ${{ github.event_name == 'workflow_dispatch' && inputs.weekly_report && '1' || '0' }}
           SEND_MONTHLY: ${{ github.event_name == 'workflow_dispatch' && inputs.monthly_report && '1' || '0' }}
           HEARTBEAT_READ_TOKEN: ${{ secrets.HEARTBEAT_READ_TOKEN }}   # same value as the cronus-forms Worker secret
