@@ -105,6 +105,26 @@
             "default": true,
             "description": "Include this endpoint in the client's Monday report"
           },
+          "alert_after_min": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1440,
+            "default": 0,
+            "description": "Only alert once the endpoint has been down at least this many minutes (0 = as soon as failure_threshold is reached)"
+          },
+          "recover_after_min": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1440,
+            "default": 0,
+            "description": "Only send RECOVERED once it has stayed healthy this many minutes; failures in between stay in the same incident (flap protection)"
+          },
+          "notify": {
+            "type": "string",
+            "enum": ["alerts", "summary"],
+            "default": "alerts",
+            "description": "\"summary\" = no real-time incident or recovery cards; outages still appear in the weekly and monthly reports"
+          },
           "kind": {
             "type": "string",
             "enum": [

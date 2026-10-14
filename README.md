@@ -113,6 +113,14 @@ A probe fails on HTTP 5xx, HTTP 404, connection errors, or latency over
   certificate, and whether anything is down right now. Set `"weekly_summary": false` on an
   endpoint to leave it out. To send one now (for a demo or a pilot check-in), run the workflow
   with **weekly_report** ticked and `dry_run` unticked; this doesn't reset the week.
+- **Noise control** (per endpoint, all optional):
+  - `"alert_after_min": 10`: only alert once it has been down 10 minutes. A blip that recovers first sends nothing.
+  - `"recover_after_min": 15`: only send RECOVERED once it has stayed healthy 15 minutes. If it fails
+    again in that window it stays one incident, and the recovery card says how many times it flapped.
+  - `"notify": "summary"`: low-priority checks send no incident or recovery cards; their outages still
+    show in the weekly and monthly reports. Certificate warnings are still sent.
+  - Critical endpoints can already alert a separate channel: give them their own `telegram_chat_id`
+    or `slack_webhook_url`, and `"severity": "critical"` to label the card.
 
 ### What an incident card tells the client
 
@@ -144,6 +152,7 @@ pip install -r requirements.txt
 python tests/smoke_test.py          # offline, no network needed
 python tests/test_reports.py        # weekly report + certificate warnings
 python tests/test_payload.py        # content checks, heartbeats, monthly report
+python tests/test_noise.py          # alert_after_min, recover_after_min (flapping), notify=summary
 (cd forms && node test.mjs)         # cronus-forms Worker, incl. heartbeat routes
 DRY_RUN=1 SENTINEL_VERBOSE_LOGS=1 python sentinel.py   # real probes, alerts printed not sent
 ```
