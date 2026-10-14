@@ -49,6 +49,10 @@ where client_id = 'bright-pixel--pilot' and endpoint_name = 'shop.co/webhooks/or
 
 Field names are the same as in `endpoints.schema.json`. Sentinel reads the change on its next run.
 
+If a client says alerts are too noisy, the usual fixes are `"recover_after_min":15` for an
+endpoint that keeps bouncing up and down, `"alert_after_min":10` for one that has short blips,
+and `"notify":"summary"` for a low-priority check that should only appear in the reports.
+
 Clients can still be listed in the `ENDPOINTS_JSON` secret instead (that's where
 `cronus-internal` lives). Both are monitored; if the same client_id + endpoint name is in
 both, the secret's copy wins.

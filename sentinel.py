@@ -25,6 +25,10 @@ What one run does
    an INCIDENT alert goes to that client's Telegram chat (and Slack, if set).
    Repeat alerts are suppressed while the incident stays open; a RESOLVED
    alert is sent on the first healthy probe afterwards.
+   Per-endpoint noise control: alert_after_min holds the incident until it has
+   been down that long; recover_after_min holds RECOVERED until it has been
+   healthy that long (failures meanwhile count as flaps in the same incident);
+   notify = "summary" tracks incidents for the reports but sends no cards.
 6. Writes updated counters back to .sentinel/state.json.
 
 Environment variables
@@ -139,6 +143,8 @@ ERROR_KEYWORDS = ("fatal error", "uncaught exception", "traceback (most recent c
 
 DEFAULT_TIMEOUT_MS = 3000
 DEFAULT_THRESHOLD = 2
+NOTIFY_MODES = ("alerts", "summary")
+MAX_HOLD_MIN = 1440   # alert_after_min / recover_after_min cap: one day
 USER_AGENT = "CronusSentinel/1.0 (+https://cronussignals.com)"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
@@ -164,6 +170,12 @@ class Endpoint:
     runbook_url: str = ""                     # optional; becomes a button on the alert
     dashboard_url: str = ""                   # optional; becomes a button on the alert
     weekly_summary: bool = True               # include in the Monday report
+    # Noise control (all optional; 0 / "alerts" keep the default behaviour)
+    alert_after_min: int = 0                  # only open an incident once it has been down this long
+    recover_after_min: int = 0                # only send RECOVERED once it has stayed healthy this long;
+                                              # failures in between stay in the same incident (flapping)
+    notify: str = "alerts"                    # "alerts" = real-time cards; "summary" = no incident,
+                                              # reminder or recovery cards, only the weekly/monthly reports
     # Content checks (all optional; any one failing makes the check fail)
     body_contains: list[str] = field(default_factory=list)      # every phrase must appear
     body_not_contains: list[str] = field(default_factory=list)  # none may appear
@@ -278,6 +290,17 @@ def parse_endpoints(items: Any) -> tuple[list[Endpoint], list[str]]:
             except (ZoneInfoNotFoundError, ValueError):
                 problems.append(f"endpoint #{i}: unknown timezone (use an IANA name like America/Chicago)")
                 continue
+        clean["notify"] = str(clean.get("notify") or "alerts").lower()
+        if clean["notify"] not in NOTIFY_MODES:
+            problems.append(f"endpoint #{i}: notify must be \"alerts\" or \"summary\"")
+            continue
+        bad_min = [k for k in ("alert_after_min", "recover_after_min")
+                   if not isinstance(clean.get(k, 0), int) or isinstance(clean.get(k, 0), bool)
+                   or not 0 <= clean.get(k, 0) <= MAX_HOLD_MIN]
+        if bad_min:
+            problems.append(f"endpoint #{i}: {', '.join(bad_min)} must be a whole number of minutes, "
+                            f"0 to {MAX_HOLD_MIN}")
+            continue
         bad_link = [k for k in ("runbook_url", "dashboard_url", "report_logo_url")
                     if clean.get(k) and not str(clean[k]).startswith("https://")]
         if bad_link:
@@ -418,6 +441,12 @@ def parse_ts(ts: str | None) -> datetime | None:
         return datetime.strptime(ts, TS_FORMAT).replace(tzinfo=timezone.utc)
     except ValueError:
         return None
+
+
+def seconds_between(start: str | None, end: str | None) -> float | None:
+    """Seconds from one state timestamp to another, or None if either is missing/unreadable."""
+    a, b = parse_ts(start), parse_ts(end)
+    return (b - a).total_seconds() if a and b else None
 
 
 def fmt_duration(delta: timedelta) -> str:
@@ -970,7 +999,7 @@ def format_resolved(ep: Endpoint, r: ProbeResult, st: dict[str, Any],
     e = esc
     now = now or datetime.now(timezone.utc)
     since = parse_ts(st.get("down_since"))
-    up = parse_ts(r.checked_at) or now
+    up = parse_ts(st.get("up_since")) or parse_ts(r.checked_at) or now   # first healthy check
     rows = [("STATUS", status_text(r)), ("LATENCY", f"{r.latency_ms} ms")]
     if since:
         rows.append(("DOWNTIME", f"~{fmt_duration(up - since)}"))
@@ -980,6 +1009,10 @@ def format_resolved(ep: Endpoint, r: ProbeResult, st: dict[str, Any],
         rows.append(("FAILED", f"{st['failure_count']} checks"))
     if st.get("last_fail_status"):
         rows.append(("CAUSE", st["last_fail_status"]))
+    if st.get("flaps"):
+        rows.append(("FLAPPED", f"failed again {st['flaps']}x before it settled"))
+    if ep.recover_after_min:
+        rows.append(("STABLE", f"healthy for {ep.recover_after_min}+ min"))
     panel = "\n".join(f"{k:<9} {e(str(v))}" for k, v in rows)
     return "\n".join([
         f"🟢 <b>RECOVERED</b> · <b>{e(ep.endpoint_name)}</b>",
@@ -1789,28 +1822,44 @@ async def run() -> int:
                 if r.blocked:  # health unknown (bot challenge, heartbeat not readable): change nothing
                     continue
                 if r.ok:
-                    since, up = parse_ts(st["down_since"]), parse_ts(r.checked_at)
+                    st["last_ok_at"] = r.checked_at
+                    if st["incident_open"] and ep.recover_after_min > 0:
+                        # Flap protection: keep the incident open until it has stayed healthy
+                        # for recover_after_min, so an up/down/up endpoint sends one pair of cards.
+                        st["up_since"] = st.get("up_since") or r.checked_at
+                        held = seconds_between(st["up_since"], r.checked_at)
+                        if held is None or held < ep.recover_after_min * 60:
+                            continue
+                    since = parse_ts(st["down_since"])
+                    up = parse_ts(st.get("up_since")) or parse_ts(r.checked_at)
                     if st["incident_open"] and since and up:
                         recovered_after = (up - since).total_seconds()
                     if st["incident_open"]:
-                        alerts.append(Alert(ep, "resolved", format_resolved(ep, r, dict(st))))
+                        if ep.notify == "alerts":
+                            alerts.append(Alert(ep, "resolved", format_resolved(ep, r, dict(st))))
                         resolved.append(idx[ep.key])
                         month_log_close(st, recovered_after)
                     st.update(failure_count=0, incident_open=False, down_since=None,
-                              last_alert_at_count=0, last_fail_status=None)
-                    st["last_ok_at"] = r.checked_at
+                              last_alert_at_count=0, last_fail_status=None, up_since=None, flaps=0)
                     continue
 
+                if st.get("up_since"):   # failed again before it settled: same incident
+                    st["flaps"] = st.get("flaps", 0) + 1
+                    st["up_since"] = None
                 st["failure_count"] += 1
                 st["last_fail_status"] = status_text(r)
                 st["down_since"] = st["down_since"] or r.checked_at
                 n = st["failure_count"]
-                opening = not st["incident_open"] and n >= ep.failure_threshold
+                down_s = seconds_between(st["down_since"], r.checked_at)
+                long_enough = ep.alert_after_min <= 0 or (
+                    down_s is not None and down_s >= ep.alert_after_min * 60)
+                opening = not st["incident_open"] and n >= ep.failure_threshold and long_enough
                 reminder = (st["incident_open"] and REMINDER_EVERY_N > 0
                             and n - st["last_alert_at_count"] >= REMINDER_EVERY_N)
                 if opening or reminder:
                     kind = "incident" if opening else "reminder"
-                    alerts.append(Alert(ep, kind, format_incident(ep, r, n, st, reminder=not opening)))
+                    if ep.notify == "alerts":
+                        alerts.append(Alert(ep, kind, format_incident(ep, r, n, st, reminder=not opening)))
                     if opening:
                         opened.append(idx[ep.key])
                         opened_now = True
